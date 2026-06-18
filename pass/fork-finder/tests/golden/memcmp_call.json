@@ -1,0 +1,37 @@
+{
+  "files": {
+    "memcmp_call.c": {
+      "functions": {
+        "eq": {
+          "lines": {
+            "4": {
+              "categories": [
+                "LibraryLoop"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "call"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "memcmp_call.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 0,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 1,
+      "MemOp": 0,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 1
+  }
+}

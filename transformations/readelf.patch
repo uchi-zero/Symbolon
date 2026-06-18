@@ -1,0 +1,61 @@
+--- a/binutils/readelf.c	2026-05-31 04:26:55.859350904 +0000
++++ b/binutils/readelf.c	2026-05-31 04:27:19.513947201 +0000
+@@ -24648,6 +24648,10 @@
+     }
+ }
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#endif
++
+ static bool
+ get_file_header (Filedata * filedata)
+ {
+@@ -24655,6 +24659,19 @@
+   if (fread (filedata->file_header.e_ident, EI_NIDENT, 1, filedata->handle) != 1)
+     return false;
+ 
++#ifdef KLEE_BITCODE
++  /* input-prefix-pin (section-header variant): pin the ELF identification
++     bytes so KLEE drives one state past the magic / class / data-encoding
++     dispatch instead of forking the per-byte classification.  */
++  klee_assume (filedata->file_header.e_ident[EI_MAG0]    == ELFMAG0);
++  klee_assume (filedata->file_header.e_ident[EI_MAG1]    == ELFMAG1);
++  klee_assume (filedata->file_header.e_ident[EI_MAG2]    == ELFMAG2);
++  klee_assume (filedata->file_header.e_ident[EI_MAG3]    == ELFMAG3);
++  klee_assume (filedata->file_header.e_ident[EI_CLASS]   == ELFCLASS32);
++  klee_assume (filedata->file_header.e_ident[EI_DATA]    == ELFDATA2LSB);
++  klee_assume (filedata->file_header.e_ident[EI_VERSION] == EV_CURRENT);
++#endif
++
+   /* Determine how to read the rest of the header.  */
+   switch (filedata->file_header.e_ident[EI_DATA])
+     {
+@@ -24717,6 +24734,27 @@
+       filedata->file_header.e_shstrndx  = BYTE_GET (ehdr64.e_shstrndx);
+     }
+ 
++#ifdef KLEE_BITCODE
++  /* input-prefix-pin (section-header variant): lay down ONE coherent section
++     header and no program headers.  Pinning e_shoff/e_shnum/e_shentsize to a
++     valid single-entry table (offset 52 == sizeof(Elf32_External_Ehdr),
++     count 1, entsize 40 == sizeof(Elf32_External_Shdr)) makes
++     get_section_headers / get_32bit_section_headers walk exactly one section
++     whose 40 bytes (sh_name, sh_type, sh_flags, … at file offset 52..91,
++     within the 100-byte sym-file) stay symbolic — so KLEE forks
++     get_section_type_name (SHT_* dispatch) and the per-section display path.
++     e_shstrndx is pinned to SHN_UNDEF so process_section_headers skips the
++     string-table read (a symbolic sh_offset/sh_size there is the alloc grind
++     that stalls the stock run); section names degrade to indices.  Zeroing
++     the program-header table keeps that path out of the way.  */
++  klee_assume (filedata->file_header.e_shoff     == 52);
++  klee_assume (filedata->file_header.e_shnum     == 1);
++  klee_assume (filedata->file_header.e_shentsize == 40);
++  klee_assume (filedata->file_header.e_shstrndx  == 0);
++  klee_assume (filedata->file_header.e_phoff == 0);
++  klee_assume (filedata->file_header.e_phnum == 0);
++#endif
++
+   return true;
+ }
+ 

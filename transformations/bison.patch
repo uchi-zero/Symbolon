@@ -1,0 +1,58 @@
+diff -urN a/src/scan-gram.c b/src/scan-gram.c
+--- a/src/scan-gram.c	2026-06-01 00:00:00.000000000 +0000
++++ b/src/scan-gram.c	2026-06-01 00:00:00.000000000 +0000
+@@ -4358,4 +4358,34 @@
+ #ifdef KLEE_BITCODE
++static int
++klee_bison_grammar_choice;
++
++#define KLEE_BISON_GRAMMAR_CASE(Choice, Text) \
++  case Choice:                                \
++    *len = sizeof Text - 1;                   \
++    return Text
++
++static const char *
++klee_bison_grammar_text (size_t *len)
++{
++  switch (klee_bison_grammar_choice)
++    {
++      KLEE_BISON_GRAMMAR_CASE (0, "%token NUM\n%%\nexpr:\n  NUM\n;\n%%\n");
++      KLEE_BISON_GRAMMAR_CASE (1, "%token NUM\n%left '+' '-'\n%left '*'\n%%\nexpr:\n  expr '+' expr\n| expr '*' expr\n| NUM\n;\n%%\n");
++      KLEE_BISON_GRAMMAR_CASE (2, "%union { int ival; }\n%token <ival> NUM\n%type <ival> expr\n%%\nexpr:\n  NUM\n;\n%%\n");
++      KLEE_BISON_GRAMMAR_CASE (3, "%locations\n%token ID\n%%\nstmt:\n  ID\n;\n%%\n");
++      KLEE_BISON_GRAMMAR_CASE (4, "%start input\n%%\ninput:\n  /* empty */\n| input item\n;\nitem:\n  'x'\n;\n%%\n");
++      KLEE_BISON_GRAMMAR_CASE (5, "%glr-parser\n%token A B\n%%\ns:\n  A\n| B\n;\n%%\n");
++      KLEE_BISON_GRAMMAR_CASE (6, "%code requires { int yylex (void); }\n%token ID\n%%\nstmt:\n  ID\n;\n%%\n");
++      KLEE_BISON_GRAMMAR_CASE (7, "%token ID\n%nterm list\n%%\nlist:\n  /* empty */\n| list ID\n;\n%%\n");
++      KLEE_BISON_GRAMMAR_CASE (8, "%define api.pure full\n%token ID\n%%\nstmt:\n  ID\n;\n%%\n");
++    }
++
++  *len = sizeof "%token NUM\n%%\nexpr:\n  NUM\n;\n%%\n" - 1;
++  return "%token NUM\n%%\nexpr:\n  NUM\n;\n%%\n";
++}
++
++#undef KLEE_BISON_GRAMMAR_CASE
++
+ static int
+ klee_bison_grammar_byte (size_t i)
+ {
+@@ -4363,6 +4393,7 @@
+ klee_bison_grammar_byte (size_t i)
+ {
+-  static const char grammar[] = "%token NUM\n%%\nexpr:\n  NUM\n;\n%%\n";
+-  return i < sizeof grammar - 1 ? grammar[i] : '\n';
++  size_t len;
++  const char *grammar = klee_bison_grammar_text (&len);
++  return i < len ? grammar[i] : '\n';
+ }
+ 
+@@ -4380,6 +4411,9 @@
+       return;
+     }
+ 
++  klee_bison_grammar_choice =
++    klee_range (0, 9, "bison_grammar_choice");
++
+   klee_assume (ch == klee_bison_grammar_byte (0));
+   for (size_t i = 1; i < 100; ++i)
+     {

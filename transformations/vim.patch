@@ -1,0 +1,70 @@
+--- a/src/ui.c	2026-06-08 14:53:18.607732946 +0000
++++ b/src/ui.c	2026-06-08 14:54:07.945601447 +0000
+@@ -17,6 +17,10 @@
+ 
+ #include "vim.h"
+ 
++#ifdef KLEE_BITCODE
++# include <klee/klee.h>
++#endif
++
+     void
+ ui_write(char_u *s, int len, int console UNUSED)
+ {
+@@ -977,6 +981,56 @@
+ #  else
+ 	len = read(read_cmd_fd, (char *)inbuf + inbufcount, readlen);
+ #  endif
++#ifdef KLEE_BITCODE
++	/* cmd-menu-pin (transformations/path-explosion/input-menu-pin), command
++	   variant. The harness makes the 120-byte stdin command stream symbolic
++	   (-N -E -s --sym-stdin 120). The plain baseline path-explodes in the Ex
++	   tokenizer (156k states, 0 completed paths) so the engine stays ~0%. Pin
++	   the freshly-read stdin bytes to one of a menu of complete, valid Ex-command
++	   PROGRAMS selected by a klee_range: each builds a buffer and exercises a
++	   distinct engine feature (:s/:g/:v regex+substitute, :m/:t/:j/:> line ops,
++	   :normal, :set, search), then exits. KLEE forks once on the selector and
++	   explores every program in ONE run; klee_assume records the bytes on the
++	   symbolic stdin object so the emitted ktest replays that exact command
++	   stream on the native cov oracle, and the concretizing copy keeps the
++	   downstream lex/parse/execute fork-free. Fires once, on the first non-empty
++	   read of fd 0. Guarded by KLEE_BITCODE so the cov oracle reads the real
++	   (replayed) bytes. Mirrors bash's cmd-menu-pin-v7. */
++	if (len > 0 && read_cmd_fd == 0)
++	{
++	    static int klee_cmd_pinned = 0;
++	    static const char *const klee_cmds[] = {
++		":i\nhello world foo\nbar baz qux\n.\n:s/o/0/g\n:%s/\\(\\w\\+\\)/[\\1]/g\n:q!\n",
++		":i\nline one\nline two\nline three\n.\n:g/two/d\n:v/one/d\n:%p\n:q!\n",
++		":i\nabc\ndef\nghi\n.\n:2,3m0\n:1t$\n:%j\n:>\n:q!\n",
++		":i\nfoo123bar\n.\n:s/[0-9]\\+/NUM/\n:s/\\a\\+/X/g\n:q!\n",
++		":set ai sw=4 et tw=20\n:i\ntext here\n.\n:set\n:q!\n",
++		":i\nAAA\nBBB\nCCC\n.\n:normal! ggVGd\n:put ='restored'\n:q!\n",
++		":i\nsearch target line\n.\n:/target/\n:?search?\n:&\n:q!\n",
++		":i\none two three four\n.\n:s/\\<\\w\\+\\>/W/g\n:s/  */ /g\n:q!\n",
++	    };
++	    enum { KLEE_NCMD = sizeof(klee_cmds)/sizeof(klee_cmds[0]) };
++	    if (!klee_cmd_pinned)
++	    {
++		unsigned sel, k;
++		const char *p = klee_cmds[0];
++		int n;
++		klee_cmd_pinned = 1;
++		sel = (unsigned)klee_range(0, KLEE_NCMD, "vim_cmd_sel");
++		for (k = 1; k < (unsigned)KLEE_NCMD; k++)
++		    if (sel == k) p = klee_cmds[k];
++		n = (int)STRLEN(p);
++		if (n > len)
++		    n = len;		/* never exceed what was read */
++		for (k = 0; k < (unsigned)n; k++)
++		{
++		    klee_assume(inbuf[inbufcount + k] == (char_u)p[k]);
++		    inbuf[inbufcount + k] = (char_u)p[k];
++		}
++		len = n;
++	    }
++	}
++#endif
+ #  ifdef FEAT_EVAL
+ 	if (len > 0)
+ 	{

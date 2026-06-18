@@ -1,0 +1,27 @@
+{
+  "files": {
+    "byteswap.h": {
+      "line_count": 2,
+      "lines": [
+        49,
+        54
+      ]
+    },
+    "system_path.c": {
+      "line_count": 5,
+      "lines": [
+        9,
+        10,
+        11,
+        12,
+        13
+      ]
+    }
+  },
+  "module": "system_path.bc",
+  "schema_version": 1,
+  "summary": {
+    "total_files": 2,
+    "total_lines": 7
+  }
+}

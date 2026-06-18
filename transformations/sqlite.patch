@@ -1,0 +1,455 @@
+--- a/src/shell.c.in
++++ b/src/shell.c.in
+@@ -982,6 +982,422 @@
+ #undef STAT_CHR_SRC
+ }
+ 
++#ifdef KLEE_BITCODE
++/* input-menu-pin v3 (transformations/path-explosion/input-menu-pin): the
++** sqlite3 CLI reads a SQL/dot-command script from a 20-byte symbolic stdin
++** (--sym-stdin 20). With those 20 bytes fully symbolic, KLEE fork-explodes in
++** the SQL tokenizer and NO state ever assembles a complete, terminating
++** statement (baseline: nurs:md2u 0 lines / 0 ktests) -- the
++** prepare/vdbe/btree execution engine is unreachable.
++**
++** This pins the symbolic stdin to ONE of a menu of complete, valid <=20-byte
++** programs, selected by a symbolic klee_range. KLEE forks ONCE on the selector
++** and explores EVERY menu entry in a SINGLE run (one bitcode, one KLEE run,
++** one manifest.json -- never a cross-run profraw union). Each branch:
++** (1) picks a concrete menu entry, (2) klee_assume()s the 20 symbolic stdin
++** bytes equal it (so the ktest replays that exact input on the native cov
++** binary), (3) concretizes the bytes so the downstream tokenize/parse/vdbe is
++** fork-free. Entries are PADDED to the full 20-byte width with trailing spaces
++** (no symbolic tail -- min-distance searchers would otherwise chase it and
++** never finish a path; md2u's baseline was 0).
++**
++** v3 adds the stdin-S_IFREG pin (see sqlite_klee_pin_stdin_regular below) on
++** top of v2's 71-entry menu. v2's bfs run lagged md2u by ~17.5k lines: KLEE's
++** POSIX model only *prefers* (klee_prefer_cex) S_IFREG for the symbolic stdin's
++** st_mode, so isatty(0) at main() entry still FORKS an S_IFCHR (character
++** device) branch. On that branch stdin_is_interactive=1 and the shell takes the
++** interactive early-bail path, so e.g. ".recover" covers 1,503 lines instead of
++** 25,616 -- and breadth-first banks exactly that shallow branch as a program's
++** covering-new ktest. Forcing st_mode==S_IFREG removes the interactive fork so
++** EVERY searcher takes the deep non-interactive path. (Same technique as
++** flex/menu-pin and bc.) Guarded by KLEE_BITCODE so the native coverage oracle
++** never sees klee_range / klee_assume. */
++#include <klee/klee.h>
++#include <sys/stat.h>
++#define SQLITE_KLEE_STDIN_WIDTH 20
++static const char *const sqlite_klee_progs[] = {
++  /* --- r1 core: engine, schema, dump/recover, sha3, extensions --- */
++  "SELECT 1;",                     /* prepare/step/finalize over in-mem db   */
++  "CREATE TABLE t(a,b);",          /* btree + schema-write path              */
++  "INSERT INTO t VALUES(1)",       /* row insert / OP_Insert                 */
++  "VACUUM;",                       /* full btree page rewrite                */
++  "EXPLAIN SELECT 1;",             /* vdbe explain output                    */
++  "SELECT json('[1]');",           /* json1 extension                        */
++  "SELECT(SELECT 1);",             /* subquery / nested prepare              */
++  "ANALYZE;",                      /* stat1 gathering                        */
++  "SELECT 9*8-7/2%3;",             /* arithmetic vdbe opcodes                */
++  "SELECT upper('ab');",           /* scalar string function                */
++  "SELECT date('now');",           /* date/time function                     */
++  "SELECT printf('%d',1)",         /* printf SQL function                    */
++  "WITH c AS(SELECT 1)c",          /* common table expression               */
++  "SELECT 1 UNION SELECT 2",       /* compound select                        */
++  "CREATE TEMP TABLE x(a)",        /* temp-db btree                          */
++  "PRAGMA function_list",          /* pragma virtual table                   */
++  "PRAGMA table_info(t)",          /* pragma table introspection             */
++  ".recover",                      /* recovery extension (large subsystem)   */
++  ".sha3sum",                      /* sha3 extension                         */
++  ".sha3sum --schema",             /* sha3 over schema                       */
++  ".lint fkey-indexes",            /* lint extension                         */
++  ".expert",                       /* query-planner expert extension         */
++  ".dbinfo",                       /* db header introspection                */
++  ".selftest",                     /* selftest dot-command                   */
++  ".backup x",                     /* online backup api                      */
++  ".restore x",                    /* restore via backup api                 */
++  ".fullschema",                   /* full schema dump                       */
++  ".dump",                         /* sql text dump                          */
++  ".tables",                       /* table listing query                    */
++  ".schema",                       /* schema listing                         */
++  ".archive",                      /* sqlar archive dot-command              */
++  ".excel",                        /* excel output mode                      */
++  ".import x t",                   /* csv import path                        */
++  ".session x",                    /* session extension                      */
++  /* --- r2 leads (native-probe-confirmed marginal-positive on r1 base) --- */
++  "SELECT 1 REGEXP 1",             /* regexp/pattern operator                */
++  "SELECT typeof(1.0);",           /* type-affinity / scalar surface         */
++  "SELECT 1 IN(1,2,3);",           /* IN-list / rowset                       */
++  "SELECT sum(1)OVER w",           /* window functions                       */
++  "SELECT'{}'->>'a'",              /* json ->> extract operator              */
++  "DETACH x;",                     /* detach database                        */
++  ".testctrl prng_save",           /* test-control dot-command               */
++  "ALTER TABLE t ADD c;",          /* alter-table add column                 */
++  "RELEASE s;",                    /* release savepoint                      */
++  ".dbconfig dqs_dml on",          /* dbconfig setter                        */
++  "SELECT zeroblob(9);",           /* zeroblob                               */
++  "SELECT randomblob(9)",          /* randomblob                             */
++  ".wheretrace 1",                 /* where-trace control                    */
++  ".progress 5",                   /* progress handler                       */
++  "SELECT*FROM json_each('[]')",   /* json_each table-valued func            */
++  "REINDEX;",                      /* reindex all                            */
++  "PRAGMA optimize",               /* optimize pragma                        */
++  ".dbconfig defensive on",        /* dbconfig defensive                     */
++  "UPDATE t SET a=1 FROM t",       /* UPDATE ... FROM                        */
++  ".mode insert t",                /* insert output mode                     */
++  ".trace stdout",                 /* sql trace                              */
++  "SELECT 1 LIKE 1 ESCAPE'x'",     /* LIKE ... ESCAPE                        */
++  ".auth on",                      /* authorizer callback                    */
++  "SELECT 1 BETWEEN 0 AND 2",      /* BETWEEN operator                       */
++  "SELECT CAST(1 AS REAL);",       /* CAST / affinity                        */
++  "SELECT x'4142';",               /* blob literal                           */
++  "CREATE TABLE w(a)WITHOUT",      /* WITHOUT ROWID table                    */
++  "PRAGMA module_list",            /* module-list pragma                     */
++  "PRAGMA secure_delete=1",        /* secure_delete pragma                   */
++  "SELECT coalesce(1,2);",         /* coalesce                               */
++  "SELECT unicode('A');",          /* unicode() scalar                       */
++  "VALUES(1),(2),(3);",            /* VALUES clause                          */
++  "SAVEPOINT s;RELEASE s",         /* savepoint+release in one line          */
++  ".vfsinfo",                      /* vfs info dot-command                   */
++  "CREATE TRIGGER a AFTER",        /* trigger create (partial)               */
++  "CREATE INDEX i ON t(a)",        /* create index                           */
++  ".parameter set :a 1",           /* named-parameter binding                */
++  /* --- r3 leads (native-probe-confirmed marginal-positive on v2 base) --- */
++  "SELECT round(1.5);",            /* float rounding / numeric format (+236) */
++  "SELECT timediff(1,2);",         /* date/time diff function (+178)         */
++  ".open --readonly x",            /* db-open option dispatch (+156)         */
++  "PRAGMA auto_vacuum=1",          /* auto_vacuum pragma (+86)               */
++  "PRAGMA mmap_size=0",            /* mmap_size pragma (+79)                 */
++  ".once -x x",                    /* .once flag form (+64)                  */
++  ".output -x x",                  /* .output flag form (+62)                */
++  "SELECT trim(' a ');",           /* trim scalar (+51)                      */
++  "SELECT abs(-1);",               /* abs scalar (+38)                       */
++  "SELECT json_group_array(1)",    /* json aggregate (+25)                   */
++  "SELECT last_insert_rowid()",    /* last_insert_rowid (+25)                */
++  "SELECT total_changes();",       /* total_changes (+25)                    */
++  "SELECT sqlite_source_id()",     /* source-id builtin (+25)                */
++  "SELECT json_quote(1);",         /* json_quote (+22)                       */
++  "SELECT quote('a');",            /* quote scalar (+20)                     */
++  "SELECT char(65);",              /* char scalar (+18)                      */
++  "SELECT 1 IS NOT 2;",            /* IS NOT operator (+15)                  */
++  "PRAGMA temp_store=1",           /* temp_store pragma (+24)                */
++  "PRAGMA index_info(i)",          /* index_info pragma (+11)                */
++  "SELECT instr('ab','b')",        /* instr scalar (+13)                     */
++  /* --- r4 leads (native-probe-confirmed marginal-positive on v3 base) --- */
++  ".intck",                        /* integrity-check extension (+1700)      */
++  "SELECT lag(1)OVER()",           /* window-frame: lag (+733)               */
++  "SELECT rank()OVER(ORDER BY 1)", /* window-frame: rank (+49)               */
++  "SELECT ntile(2)OVER()",         /* window-frame: ntile (+49)              */
++  "SELECT*FROM dbstat",            /* dbstat virtual table (+184)            */
++  "SELECT'[1]'->0",                /* json path -> int subscript (+40)       */
++  "SELECT'{'->>'a'",               /* json ->> on malformed input (+38)      */
++  "SELECT unhex('41')",            /* unhex scalar (+29)                     */
++  "SELECT time('now')",            /* time() date func (+23)                 */
++  "SELECT log(10)",                /* log math func (+26)                    */
++  "SELECT pow(2,3)",               /* pow math func (+20)                    */
++  "SELECT mod(5,2)",               /* mod math func (+20)                    */
++  "SELECT raise(IGNORE)",          /* RAISE outside trigger -> parse err (+20)*/
++  "SELECT sqrt(9)",                /* sqrt math func (+17)                   */
++  "SELECT sign(-5)",               /* sign math func (+15)                   */
++  "SELECT ceil(1.2)",              /* ceil math func (+15)                   */
++  "SELECT floor(1.8)",             /* floor math func (+15)                  */
++  ".connection",                   /* .connection dot-command (+14)          */
++  ".nonce x",                      /* .nonce dot-command (+11)               */
++  "SELECT pi()",                   /* pi math func (+11)                     */
++  "PRAGMA cache_size=10",          /* cache_size setter (+9)                 */
++  "PRAGMA page_size=512",          /* page_size setter (+8)                  */
++  "DROP INDEX IF EXISTS i",        /* drop-index path (+6)                   */
++  "DROP VIEW IF EXISTS v",         /* drop-view path (+6)                    */
++  "PRAGMA count_changes=1",        /* count_changes setter (+5)              */
++  /* --- r5 tail (the residual +145; r4 broad-sweep positives, all <=20b; the   */
++  /*     window-fn forms truncate to parse-error/window-misuse reporting paths) */
++  "SELECT sum(1)OVER(ROWS 1)",     /* ROWS-frame -> window parse path (+17)  */
++  "PRAGMA threads=2",              /* threads pragma (+16)                   */
++  "SELECT last_value(1)OVER()",    /* last_value window misuse path (+14)    */
++  ".scanstats on",                 /* scanstats dot-command (+14)            */
++  "SELECT dense_rank()OVER()",     /* dense_rank window misuse path (+14)    */
++  "SELECT cume_dist()OVER()",      /* cume_dist window misuse path (+14)     */
++  ".dbconfig trusted_schema",      /* dbconfig trusted_schema getter (+11)   */
++  ".system echo",                  /* .system dot-command (+10)              */
++  ".shell echo",                   /* .shell dot-command (+10)               */
++  "SELECT ln(2)",                  /* ln math func (+9)                      */
++  ".intck 1",                      /* intck with step arg (+9)               */
++  ".timer on",                     /* .timer dot-command (+8)                */
++  ".trace --row",                  /* .trace --row flag (+7)                 */
++  ".echo on",                      /* .echo dot-command (+6)                 */
++  "SELECT degrees(1)",             /* degrees math func (+6)                 */
++  "SELECT cos(1)",                 /* cos math func (+6)                     */
++  "SELECT atan2(1,1)",             /* atan2 math func (+6)                   */
++  "SELECT exp(1)",                 /* exp math func (+5)                     */
++  "PRAGMA data_version",           /* data_version pragma (+4)               */
++  "SELECT jsonb('1')",             /* jsonb scalar (+4)                      */
++  ".bail on",                      /* .bail dot-command (+4)                 */
++  "SELECT log2(8)",                /* log2 math func (+3)                    */
++  "EXPLAIN QUERY PLAN VALUES(1)",  /* EXPLAIN QP parse path (+3)             */
++  ".binary on",                    /* .binary dot-command (+3)               */
++  "PRAGMA soft_heap_limit",        /* soft_heap_limit pragma (+2)            */
++  "PRAGMA max_page_count",         /* max_page_count pragma (+2)             */
++  "PRAGMA collation_list",         /* collation_list pragma (+2)             */
++  /* --- r6 tail (the +1,001 union the r5 broad sweep found: transaction      */
++  /*     locking, dot-command flag space, bit operators; clean <=20b forms)   */
++  "BEGIN IMMEDIATE",               /* IMMEDIATE-lock txn state machine (+223)*/
++  "BEGIN EXCLUSIVE",               /* EXCLUSIVE-lock txn state machine (+221)*/
++  ".parameter clear",              /* .parameter clear (+105)                */
++  ".indexes",                      /* .indexes dot-command (+91)             */
++  ".filectrl size",                /* .filectrl dot-command (+58)            */
++  ".open --append x",              /* .open --append (+51)                   */
++  ".mode pretty",                  /* .mode pretty output (+46)              */
++  ".limit length 9",               /* .limit dot-command (+41)               */
++  ".help SELECT",                  /* .help with arg (+39)                   */
++  "SELECT 1<<4>>1",                /* bit-shift operators (+39)              */
++  "SELECT 5&3",                    /* bit-and operator (+30)                 */
++  "SELECT total(1)",               /* total() aggregate (+34)                */
++  "PRAGMA shrink_memory",          /* shrink_memory pragma (+29)             */
++  "SELECT 1 NOT IN(1)",            /* NOT IN list (+21)                      */
++  "BEGIN;ROLLBACK",                /* rollback path (+20)                    */
++  "SELECT NOT 1",                  /* NOT unary operator (+14)               */
++  ".vfslist",                      /* .vfslist dot-command (+14)             */
++  "PRAGMA synchronous=2",          /* synchronous setter (+13)               */
++  ".width 1 2 3",                  /* .width dot-command (+12)               */
++  ".parameter list",               /* .parameter list (+12)                  */
++  ".log stdout",                   /* .log dot-command (+12)                 */
++  ".clone x",                      /* .clone dot-command (+12)               */
++  "SELECT 1 MATCH 1",              /* MATCH operator (+9)                    */
++  ".output stdout",                /* .output dot-command (+9)               */
++  ".changes on",                   /* .changes dot-command (+9)              */
++  ".separator , .",                /* .separator dot-command (+8)            */
++  "SELECT nullif(1,2)",            /* nullif scalar (+7)                     */
++  ".stats vmstep",                 /* .stats vmstep (+7)                     */
++  ".cd .",                         /* .cd dot-command (+7)                   */
++  "SELECT 1 ISNULL",               /* ISNULL postfix (+6)                    */
++  ".progress -q 5",                /* .progress -q flag (+6)                 */
++  ".headers on",                   /* .headers dot-command (+6)              */
++  "ROLLBACK TO s",                 /* rollback-to-savepoint (+5)             */
++  ".nullvalue X",                  /* .nullvalue dot-command (+4)            */
++  "SELECT max(1,2,3)",             /* max(args) scalar (+3)                  */
++  "SELECT min(3,2,1)",             /* min(args) scalar (+3)                  */
++  "DROP TABLE t",                  /* drop-table path (+3)                   */
++  ".restore main x",               /* .restore with db arg (+3)              */
++  "SELECT 1 IN(2,3)",              /* IN-list literal (+2)                   */
++  ".testctrl tune",                /* .testctrl tune (+2)                    */
++  ".open -nofollow x",             /* .open -nofollow flag (+2)              */
++  /* --- r7 tail (+716; the arg-taking dot-command vein from the r6 sweep:    */
++  /*     a dot-command + table/option argument reaches code the bare form skips) */
++  ".schema t",                     /* .schema with table arg -> schema LIKE (+542)*/
++  ".dump t",                       /* .dump with table arg (+41)             */
++  ".recover --ignore",             /* .recover --ignore flag (+20)           */
++  "SELECT quote(x'00')",           /* quote() of a blob literal (+19)        */
++  "SELECT trunc(-1.5)",            /* trunc of negative (+17)                */
++  ".eqp trace",                    /* .eqp trace mode (+14)                  */
++  "PRAGMA cache_spill=9",          /* cache_spill setter (+14)               */
++  "SELECT 1 WINDOW w AS(",         /* named WINDOW clause parse (+13)        */
++  ".sha3sum --256",                /* sha3sum --256 flag (+11)               */
++  ".import --csv x t",             /* .import --csv flag (+8)                */
++  ".expert --verbose",             /* .expert --verbose flag (+8)            */
++  ".schema --indent",              /* .schema --indent flag (+4)             */
++  ".backup main x",                /* .backup with db arg (+3)               */
++  "INSERT OR FAIL INTO",           /* OR FAIL conflict-clause parse (+3)     */
++  "INSERT OR ABORT t",             /* OR ABORT conflict-clause parse (+3)    */
++  ".tables %",                     /* .tables with LIKE pattern (+2)         */
++  ".mode json --new",              /* .mode json --new flag (+2)             */
++  ".save x.db",                    /* .save with filename (+1)               */
++  "SELECT radians(90)",            /* radians math func (+1)                 */
++  "SELECT '[1]'->'$[0]'",          /* json -> with path arg (+1)             */
++  /* --- r8 tail (+630; the .open VFS/format-flag family + dot-command flags  */
++  /*     from the r7 sweep) */
++  ".open --zip x",                 /* ZIP-archive VFS open (+262)            */
++  ".clone --help",                 /* .clone --help (+54)                    */
++  ".open --hexdb x",              /* hexdb VFS open (+46)                    */
++  ".indexes t",                    /* .indexes with table arg (+38)          */
++  ".restore main x",               /* .restore with db arg (+26)             */
++  ".open --deserialize",           /* deserialize VFS open (+23)             */
++  ".import --ascii x t",           /* .import --ascii (+22)                  */
++  "SELECT 1e999",                  /* numeric-overflow literal (+20)         */
++  ".backup --append x",            /* .backup --append (+12)                 */
++  ".filectrl persist",             /* .filectrl persist_wal (+10)            */
++  ".parameter unset :x",           /* .parameter unset (+9)                  */
++  ".recover --lost",               /* .recover --lost flag (+8)              */
++  ".recover --freelist",           /* .recover --freelist flag (+8)          */
++  ".progress --reset",             /* .progress --reset flag (+8)            */
++  ".import x t --skip",            /* .import --skip flag (+7)               */
++  ".expert --sample 9",            /* .expert --sample (+7)                  */
++  ".excel --help",                 /* .excel --help (+7)                     */
++  "SELECT no_func(1)",             /* unknown-function error path (+6)       */
++  ".mode column --wrap",           /* .mode column --wrap (+5)               */
++  ".auth off",                     /* .auth off (+5)                         */
++  ".vfsname main",                 /* .vfsname with db arg (+4)              */
++  ".stats off",                    /* .stats off (+4)                        */
++  ".echo off",                     /* .echo off (+4)                         */
++  ".changes off",                  /* .changes off (+4)                      */
++  "SELECT x'zz'",                  /* malformed-blob error path (+3)         */
++  ".system ls .",                  /* .system with arg (+3)                  */
++  ".mode box --noquote",           /* .mode box --noquote (+3)               */
++  ".width -5 10",                  /* .width negative (+2)                   */
++  ".timer off",                    /* .timer off (+2)                        */
++  ".schema --debug",               /* .schema --debug flag (+2)              */
++  ".headers off",                  /* .headers off (+2)                      */
++  ".fullschema --indent",          /* .fullschema --indent (+2)              */
++  ".bail off",                     /* .bail off (+2)                         */
++  ".trace off",                    /* .trace off (+1)                        */
++  ".stats stmt",                   /* .stats stmt (+1)                       */
++  ".output --bom x",               /* .output --bom (+1)                     */
++  ".once --bom x",                 /* .once --bom (+1)                       */
++  ".log off",                      /* .log off (+1)                          */
++  /* --- r9 tail (+929; the .archive/.ar sqlar subcommand family + .dump      */
++  /*     options + .open flags from the r8 sweep) */
++  ".archive -c x",                 /* sqlar archive create (+778)            */
++  ".ar -tvf x",                    /* .ar alias, list-verbose (+87)          */
++  ".archive -x x",                 /* sqlar extract (+64)                    */
++  ".archive -t x",                 /* sqlar list (+63)                       */
++  ".archive -u x",                 /* sqlar update (+61)                     */
++  ".dump --json",                  /* .dump --json (+12)                     */
++  ".dump --csv",                   /* .dump --csv (+12)                      */
++  ".dump --preserve",              /* .dump --preserve-rowids (+12)          */
++  ".testctrl localtime",           /* .testctrl localtime (+8)               */
++  "PRAGMA cache_size=-9",          /* negative cache_size (KiB) (+8)         */
++  ".open --new x",                 /* .open --new (+8)                       */
++  ".dump --nosys",                 /* .dump --nosys (+8)                     */
++  "SELECT 1 FILTER(W",             /* aggregate FILTER clause parse (+7)     */
++  "PRAGMA pragma_list",            /* pragma_list pragma (+7)                */
++  ".explain off",                  /* .explain off (+7)                      */
++  ".dump --data-only",             /* .dump --data-only (+7)                 */
++  ".explain auto",                 /* .explain auto (+6)                     */
++  ".import --schema x t",          /* .import --schema (+5)                  */
++  "SELECT 1--c",                   /* line-comment lexer path (+5)           */
++  ".dump --newlines",              /* .dump --newlines (+5)                  */
++  "SELECT 1->>2->>3",              /* chained ->> json operators (+4)        */
++  ".import --skip 9 x t",          /* .import --skip (+4)                    */
++  ".schema --nosys",               /* .schema --nosys (+3)                   */
++  "PRAGMA optimize(2)",            /* optimize with mask arg (+3)            */
++  ".open --maxsize 9 x",           /* .open --maxsize (+3)                   */
++  ".open --key k x",               /* .open --key (encryption stub) (+3)     */
++  "SELECT 'a''b'",                 /* escaped-quote string literal (+3)      */
++  ".recover --no-rowids",          /* .recover --no-rowids (+2)              */
++  "SELECT 1 OVER(RANGE)",          /* RANGE-frame window parse (+1)          */
++  ".scanstats est",                /* .scanstats est (+1)                    */
++  ".open --append y",              /* .open --append variant (+1)            */
++  ".eqp full",                     /* .eqp full (+1)                         */
++  /* --- r10 tail (+191; the symbolically-REALIZABLE residual from the r9     */
++  /*     sweep -- the .ar archive-create variants were EXCLUDED, since their  */
++  /*     native marginal does not realize under klee-uclibc's POSIX I/O model) */
++  "VACUUM INTO 'x'",               /* VACUUM INTO file (+28)                 */
++  "SELECT -0x10",                  /* negative hex literal (+20)             */
++  "SELECT 0x1f+1",                 /* hex literal arithmetic (+20)           */
++  ".archive --help",               /* .archive usage text (+20)              */
++  ".restore -v x",                 /* .restore -v (+18)                      */
++  "SELECT NULL IS NULL",           /* IS NULL on NULL literal (+15)          */
++  "REINDEX nocase",                /* reindex a collation (+15)              */
++  "ANALYZE t",                     /* analyze one table (+15)                */
++  "SELECT 9223372036854",          /* large integer literal (+14)            */
++  "REINDEX t",                     /* reindex one table (+14)                */
++  "SELECT 1 COLLATE BIN",          /* COLLATE expr (+13)                     */
++  ".read",                         /* .read with no arg -> usage (+8)        */
++  ".backup -v x",                  /* .backup -v (+5)                        */
++  "ANALYZE main",                  /* analyze a schema (+5)                  */
++  "SELECT 1.5e3",                  /* real exponent literal (+4)             */
++  ".expert --help",                /* .expert usage (+4)                     */
++  ".expert --sample 1 x",          /* .expert --sample (+4)                  */
++  "SELECT 0b101",                  /* binary literal (+3)                    */
++  "SELECT 1 \\",                   /* trailing backslash lexer path (+3)     */
++  ".testctrl prng_seed",           /* prng_seed test-control (+3)            */
++  "SELECT [col]"                   /* bracket-quoted identifier (+2)         */
++};
++enum { SQLITE_KLEE_NPROGS =
++         sizeof(sqlite_klee_progs)/sizeof(sqlite_klee_progs[0]) };
++static int sqlite_klee_pinned = 0;   /* selector fired this run?             */
++static int sqlite_klee_done = 0;     /* the one pinned line already served?  */
++
++/* v3 stdin-S_IFREG pin: called once at main() entry, BEFORE isatty(0). KLEE's
++** POSIX model only prefers S_IFREG for the symbolic stdin's st_mode, so without
++** this the isatty(0) check forks an S_IFCHR branch on which the shell goes
++** interactive and bails early. klee_assume((st_mode & S_IFMT)==S_IFREG) prunes
++** that fork so every searcher (not just min-distance ones) takes the deep
++** non-interactive path. */
++static void sqlite_klee_pin_stdin_regular(void){
++  struct stat st;
++  if( fstat(0, &st)==0 ){
++    klee_assume( (st.st_mode & S_IFMT)==S_IFREG );
++  }
++}
++
++/* Pin the symbolic stdin to one menu entry (once), then serve that single
++** line on the first call and EOF (NULL) thereafter. */
++static char *sqlite_klee_getline(char *zLine){
++  char buf[SQLITE_KLEE_STDIN_WIDTH];
++  const char *p;
++  unsigned sel, k;
++  int i, len;
++  ssize_t r;
++
++  if( sqlite_klee_done ){ free(zLine); return 0; }
++
++  /* Consume the symbolic stdin bytes so the ktest carries the pin. */
++  r = read(0, buf, SQLITE_KLEE_STDIN_WIDTH);
++  if( r < 0 ) r = 0;
++
++  if( !sqlite_klee_pinned ){
++    sqlite_klee_pinned = 1;
++    sel = (unsigned)klee_range(0, SQLITE_KLEE_NPROGS, "sqlite_prog_sel");
++    p = sqlite_klee_progs[0];
++    for( k=1; k<(unsigned)SQLITE_KLEE_NPROGS; k++ ){
++      if( sel==k ) p = sqlite_klee_progs[k];  /* concrete ptr per fork */
++    }
++  }else{
++    p = sqlite_klee_progs[0];
++  }
++
++  len = 0;
++  while( len<SQLITE_KLEE_STDIN_WIDTH && p[len]!='\0' ) len++;
++
++  /* Pin ALL SQLITE_KLEE_STDIN_WIDTH symbolic stdin bytes: the program text,
++  ** then space padding to the full width (no symbolic tail). The ktest then
++  ** replays these exact 20 bytes on the native coverage binary -- which is
++  ** where the headline coverage is measured (it never sees this pin). The
++  ** concretization (buf[i]=c) keeps the KLEE-side tokenize/parse fork-free. */
++  for( i=0; i<SQLITE_KLEE_STDIN_WIDTH && i<(int)r; i++ ){
++    char c = (i<len) ? p[i] : ' ';
++    klee_assume( buf[i]==c );
++    buf[i] = c;
++  }
++
++  /* Hand back the pinned program text as one line (trailing pad is harmless
++  ** trailing whitespace on the native side; here we trim it). */
++  zLine = realloc(zLine, len+1);
++  shell_check_oom(zLine);
++  for( i=0; i<len; i++ ) zLine[i] = p[i];
++  zLine[len] = 0;
++  sqlite_klee_done = 1;
++  return zLine;
++}
++#endif /* KLEE_BITCODE */
++
+ /*
+ ** This routine reads a line of text from FILE in, stores
+ ** the text in memory obtained from malloc() and returns a pointer
+@@ -995,6 +1411,15 @@
+   int nLine = zLine==0 ? 0 : 100;
+   int n = 0;
+ 
++#ifdef KLEE_BITCODE
++  /* Under symbolic execution, serve a pinned menu program from stdin (the only
++  ** input the --sym-stdin harness makes symbolic). For any other stream (e.g.
++  ** .read FILE) fall through to the normal reader. */
++  if( in==stdin || in==0 ){
++    return sqlite_klee_getline(zLine);
++  }
++#endif
++
+   while( 1 ){
+     if( n+100>nLine ){
+       if( nLine>=1073741773 ){
+@@ -12968,6 +13393,13 @@
+   stdout_is_console = 1;
+   data.wasm.zDefaultDbName = "/fiddle.sqlite3";
+ #else
++#ifdef KLEE_BITCODE
++  /* Pin symbolic stdin to a regular file BEFORE isatty(0), so KLEE does not
++  ** fork the interactive (S_IFCHR) branch that makes the shell bail early --
++  ** see sqlite_klee_pin_stdin_regular. This is what lets every searcher (not
++  ** just min-distance ones) reach the deep non-interactive path. */
++  sqlite_klee_pin_stdin_regular();
++#endif
+   stdin_is_interactive = isatty(0);
+   stdout_is_console = isatty(1);
+ #endif

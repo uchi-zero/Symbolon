@@ -1,0 +1,120 @@
+diff -urN a/ncurses/tinfo/comp_hash.c b/ncurses/tinfo/comp_hash.c
+--- a/ncurses/tinfo/comp_hash.c	2026-05-31 06:24:29.075577713 +0000
++++ b/ncurses/tinfo/comp_hash.c	2026-05-31 06:25:07.998414660 +0000
+@@ -45,6 +45,10 @@
+ #include <tic.h>
+ #include <hashsize.h>
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#endif
++
+ MODULE_ID("$Id: comp_hash.c,v 1.56 2024/12/07 20:05:08 tom Exp $")
+ 
+ /*
+@@ -63,19 +67,34 @@
+ 
+     hashvalue = data->hash_of(string);
+ 
++#ifdef KLEE_BITCODE
++    /* r10/r11: concretize the hash index into real_table (497 entries).
++     * Cap-name bytes are pinned, so the hash is deterministic;
++     * klee_get_valuell picks the unique concrete value and continues. */
++    hashvalue = (int)klee_get_valuell((long long)hashvalue);
++#endif
++
+     if (hashvalue >= 0
+ 	&& (unsigned) hashvalue < data->table_size
+ 	&& data->table_data[hashvalue] >= 0) {
+-
++	int idx0 = data->table_data[hashvalue];
++#ifdef KLEE_BITCODE
++	idx0 = (int)klee_get_valuell((long long)idx0);
++#endif
+ 	real_table = _nc_get_table(termcap);
+-	ptr = real_table + data->table_data[hashvalue];
++	ptr = real_table + idx0;
+ 	while (!data->compare_names(ptr->nte_name, string)) {
+ 	    if (ptr->nte_link < 0) {
+ 		ptr = NULL;
+ 		break;
+ 	    }
+-	    ptr = real_table + (ptr->nte_link
+-				+ data->table_data[data->table_size]);
++	    {
++		int idx_next = ptr->nte_link + data->table_data[data->table_size];
++#ifdef KLEE_BITCODE
++		idx_next = (int)klee_get_valuell((long long)idx_next);
++#endif
++		ptr = real_table + idx_next;
++	    }
+ 	}
+     }
+ 
+diff -urN a/progs/tic.c b/progs/tic.c
+--- a/progs/tic.c	2026-05-31 06:24:29.046577835 +0000
++++ b/progs/tic.c	2026-05-31 06:25:42.459270293 +0000
+@@ -49,6 +49,10 @@
+ #include <parametrized.h>
+ #include <transform.h>
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#endif
++
+ MODULE_ID("$Id: tic.c,v 1.334 2025/12/25 21:27:48 tom Exp $")
+ 
+ #define STDIN_NAME "<stdin>"
+@@ -716,6 +720,20 @@
+ 
+     log_fp = stderr;
+ 
++#ifdef KLEE_BITCODE
++    /* r11: argv pin `tic -I A` (infodump) + 2-entry termcap file. The
++     * second entry's `tc=b:` triggers _nc_resolve_uses2's full pipeline
++     * (collision check, in-core resolution via _nc_name_match, then the
++     * merge stage with _nc_merge_entry / _nc_copy_termtype2 / validate).
++     * Keeps the r10 comp_hash.c concretize fix above. */
++    klee_assume(argc == 3);
++    klee_assume(argv[1][0] == '-');
++    klee_assume(argv[1][1] == 'I');
++    klee_assume(argv[1][2] == '\0');
++    klee_assume(argv[2][0] == 'A');
++    klee_assume(argv[2][1] == '\0');
++#endif
++
+     _nc_progname = _nc_rootname(argv[0]);
+     atexit(cleanup);
+ 
+@@ -960,6 +978,31 @@
+ 	}
+     }
+ 
++#ifdef KLEE_BITCODE
++    /* r11: 2-entry termcap file (33 bytes content + 67 bytes newline pad).
++     * Entry 1 (`b|t:co#80:cm=\E[%p1%dH:`) supplies cols + parameterized
++     * cursor-motion. Entry 2 (`a|s:tc=b:`) references entry 1 via the
++     * termcap `tc=` clause, driving _nc_resolve_uses2's resolution +
++     * merge stages. The `\n` between entries is the entry separator. */
++    if (tmp_fp != NULL) {
++	static const char r11_entries[] =
++	    "b|t:co#80:cm=\\E[%p1%dH:\na|s:tc=b:";  /* 33 bytes */
++	const int prefix_len = (int)(sizeof r11_entries - 1);
++	int i;
++	for (i = 0; i < prefix_len; i++) {
++	    int ch = fgetc(tmp_fp);
++	    if (ch == EOF) break;
++	    klee_assume((unsigned char)ch == (unsigned char)r11_entries[i]);
++	}
++	for (; i < 100; i++) {
++	    int ch = fgetc(tmp_fp);
++	    if (ch == EOF) break;
++	    klee_assume((unsigned char)ch == (unsigned char)'\n');
++	}
++	rewind(tmp_fp);
++    }
++#endif
++
+     if (infodump || check_only) {
+ 	dump_init(tversion,
+ 		  (smart_defaults

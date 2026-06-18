@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# eval-klee — single-shot KLEE evaluation pipeline.
+#
+# Reads baked program metadata from $SYMBOLON_PROGRAM_DIR (default /opt/program):
+#   program.bc, program.cov, program.json
+#
+# KLEE is always invoked with --posix-runtime --libc=uclibc --ubsan-runtime;
+# --libcxx is added if program.json sets with-libcxx. --ubsan-runtime links
+# KLEE's UBSan handler library; it is load-bearing because the bitcode is
+# compiled with -fsanitize=undefined (see program-builder.nix) — omitting it
+# turns every __ubsan_handle_* into a spurious "failed external call".
+# Symbolic-environment args (sym-args,
+# sym-stdin, sym-files, sym-stdout) come from program.json's sym-env list.
+
+# @option --bitcode             Override path to bitcode (defaults to $SYMBOLON_PROGRAM_DIR/program.bc).
+# @option --search              Search heuristic (e.g. dfs, nurs:covnew). KLEE default if omitted.
+# @option --max-time=1h         KLEE wall-clock budget (Ns/Nm/Nh).
+# @option --max-memory          KLEE --max-memory (MB; unset means no override).
+# @option --klee-extra*         Extra flag appended verbatim to klee. Use the `=` form for `--`-prefixed values, e.g. --klee-extra=--max-static-fork-pct=30.
+# @option --out!                Output directory for klee-out, coverage, manifest.
+# @option --cov-sample-every=5m Coverage trajectory sample interval (Ns/Nm/Nh). 0 disables.
+# @flag   --stop-on-plateau     Stop KLEE early at coverage plateau (default off → fixed-budget run to --max-time).
+# @option --plateau-window=10m  Plateau window: stop when no new ktest AND CoveredInstructions flat for this long.
+# @option --plateau-poll=60s    Plateau-watcher poll cadence.
+
+set -euo pipefail
+eval "$(argc --argc-eval "$0" "$@")"
+
+prog_dir="${SYMBOLON_PROGRAM_DIR:-/opt/program}"
+bitcode="${argc_bitcode:-}"
+search="${argc_search:-}"
+max_time="$argc_max_time"
+max_memory="${argc_max_memory:-}"
+klee_extras=("${argc_klee_extra[@]+"${argc_klee_extra[@]}"}")
+out="$argc_out"
+cov_sample_every="$argc_cov_sample_every"
+stop_on_plateau="${argc_stop_on_plateau:-0}"
+plateau_window="$argc_plateau_window"
+plateau_poll="$argc_plateau_poll"
+
+[[ -d "$prog_dir" ]] || { echo "eval-klee: program dir not found: $prog_dir" >&2; exit 2; }
+
+bitcode="${bitcode:-$prog_dir/program.bc}"
+cov_binary="$prog_dir/program.cov"
+program_json="$prog_dir/program.json"
+
+for f in "$bitcode" "$cov_binary" "$program_json"; do
+  [[ -f "$f" ]] || { echo "eval-klee: missing $f" >&2; exit 2; }
+done
+
+mkdir -p "$out" "$out/profraw" "$out/coverage"
+
+# ---- KLEE invocation: fixed flags (always-on for this project) ----
+fixed_flags=(
+  "--posix-runtime"
+  "--libc=uclibc"
+  "--ubsan-runtime"
+  "--solver-backend=z3"
+  "--only-output-states-covering-new"
+  "--dump-states-on-halt=false"
+  "--write-kqueries"
+  "--write-smt2s"
+  "--write-cov"
+)
+
+if [[ "$(jq -r '."with-libcxx" // false' "$program_json")" == "true" ]]; then
+  fixed_flags+=("--libcxx")
+fi
+
+# --watchdog enforces --max-time via an external fork. Under --stop-on-plateau
+# the plateau watcher is the time-keeper (it owns SIGINT/SIGKILL and the
+# ceiling), so we drop the watchdog to keep a single, directly-signalable klee
+# PID. Otherwise keep the watchdog exactly as before.
+if [[ "$stop_on_plateau" != "1" ]]; then
+  fixed_flags+=("--watchdog")
+fi
+
+# ---- Symbolic environment (args appended after the bitcode) ----
+mapfile -t sym_env < <(jq -r '.["sym-env"] // [] | .[]' "$program_json")
+
+# ---- Runtime overrides ----
+runtime_args=("--max-time=$max_time")
+[[ -n "$search"     ]] && runtime_args+=("--search=$search")
+[[ -n "$max_memory" ]] && runtime_args+=("--max-memory=$max_memory")
+
+# ---- Hashes for manifest ----
+input_bc_sha256="$(sha256sum "$bitcode" | cut -d' ' -f1)"
+baseline_bc_sha256="$(sha256sum "$prog_dir/program.bc" | cut -d' ' -f1)"
+
+# ---- Capture start epoch for cov-trajectory ----
+klee_start_epoch="$(date +%s)"
+echo "$klee_start_epoch" > "$out/klee-start-epoch.txt"
+
+to_seconds() {
+  local v="$1"
+  case "$v" in
+    *s) echo "${v%s}" ;;
+    *m) echo $(( ${v%m} * 60 )) ;;
+    *h) echo $(( ${v%h} * 3600 )) ;;
+    *d) echo $(( ${v%d} * 86400 )) ;;
+    *)  echo "$v" ;;
+  esac
+}
+max_time_seconds="$(to_seconds "$max_time")"
+
+# ---- Run KLEE ----
+klee_out="$out/klee-out"
+rm -rf "$klee_out"
+
+klee_cmd=(klee
+  "--output-dir=$klee_out"
+  "${fixed_flags[@]}"
+  "${runtime_args[@]}"
+  "${klee_extras[@]+"${klee_extras[@]}"}"
+  "$bitcode"
+  "${sym_env[@]+"${sym_env[@]}"}")
+
+stop_reason="completed"
+if [[ "$stop_on_plateau" == "1" ]]; then
+  # Background KLEE; the watcher polls live ktests + run.stats and SIGINTs the
+  # worker at plateau, or at the --max-time ceiling. The existing post-run
+  # replay/merge/manifest pipeline then runs on whatever ktests exist.
+  reason_file="$out/.plateau-reason"; : > "$reason_file"
+  set +e
+  "${klee_cmd[@]}" > "$out/klee.stdout" 2> "$out/klee.stderr" &
+  klee_pid=$!
+  "$(dirname "$0")/klee-plateau-watch" \
+    --klee-out "$klee_out" --pid "$klee_pid" \
+    --window "$plateau_window" --poll "$plateau_poll" \
+    --ceiling "$max_time_seconds" --reason-file "$reason_file" \
+    > "$out/plateau-watch.log" 2>&1 &
+  watch_pid=$!
+  wait "$klee_pid"; klee_exit=$?
+  kill "$watch_pid" 2>/dev/null; wait "$watch_pid" 2>/dev/null
+  set -e
+  case "$(cat "$reason_file" 2>/dev/null || true)" in
+    plateau) stop_reason="plateau" ;;
+    ceiling) stop_reason="max-time" ;;
+    exited)  stop_reason="completed" ;;  # klee exhausted all paths on its own
+    *)       stop_reason="completed" ;;  # empty/unknown → treat as completed
+  esac
+else
+  set +e
+  "${klee_cmd[@]}" > "$out/klee.stdout" 2> "$out/klee.stderr"
+  klee_exit=$?
+  set -e
+fi
+klee_elapsed=$(( $(date +%s) - klee_start_epoch ))
+
+# ---- Replay every ktest against the instrumented oracle ----
+# Default per-ktest replay timeout is 30s; programs no longer carry a
+# per-program override since the inner timeout (KLEE_REPLAY_TIMEOUT) is
+# what bounds the replayed program itself.
+"$(dirname "$0")/klee-replay-all" \
+  --binary "$cov_binary" \
+  --klee-out "$klee_out" \
+  --profraw-dir "$out/profraw" \
+  --replays-jsonl "$out/replays.jsonl" \
+  --timeout 30s \
+  || true
+
+# ---- Merge coverage and emit reports ----
+# `|| true` so a coverage merge failure (e.g., a corrupt profraw from a
+# crashed replay) still produces a manifest reflecting the partial run.
+"$(dirname "$0")/cov-merge" \
+  --binary "$cov_binary" \
+  --profraw-dir "$out/profraw" \
+  --out "$out/coverage" \
+  || true
+
+# ---- Coverage trajectory (post-hoc walk over ktest mtimes) ----
+trajectory_file=""
+cov_sample_every_s="$(to_seconds "$cov_sample_every")"
+if (( cov_sample_every_s > 0 )); then
+  trajectory_file="coverage-trajectory.csv"
+  "$(dirname "$0")/cov-trajectory" \
+    --klee-out "$klee_out" \
+    --profraw-dir "$out/profraw" \
+    --binary "$cov_binary" \
+    --max-time-seconds "$max_time_seconds" \
+    --klee-start-epoch "$klee_start_epoch" \
+    --sample-every "$cov_sample_every" \
+    --out "$out/$trajectory_file" \
+    || { echo "eval-klee: cov-trajectory failed; trajectory will be omitted from manifest" >&2; trajectory_file=""; }
+fi
+
+# ---- Coverage totals (jq parses the LLVM JSON export) ----
+# Extracts covered/count for all five llvm-cov metrics in one shot.
+coverage_json="$(
+  jq -c '
+    .data[0].totals as $t |
+    {
+      "functions-covered":      ($t.functions.covered      // 0),
+      "functions-total":        ($t.functions.count        // 0),
+      "instantiations-covered": ($t.instantiations.covered // 0),
+      "instantiations-total":   ($t.instantiations.count   // 0),
+      "lines-covered":          ($t.lines.covered          // 0),
+      "lines-total":            ($t.lines.count            // 0),
+      "regions-covered":        ($t.regions.covered        // 0),
+      "regions-total":          ($t.regions.count          // 0),
+      "branches-covered":       ($t.branches.covered       // 0),
+      "branches-total":         ($t.branches.count         // 0)
+    }
+  ' "$out/coverage/report.json" 2>/dev/null \
+    || echo '{"functions-covered":0,"functions-total":0,"instantiations-covered":0,"instantiations-total":0,"lines-covered":0,"lines-total":0,"regions-covered":0,"regions-total":0,"branches-covered":0,"branches-total":0}'
+)"
+
+# ---- Manifest ----
+program_name="$(jq -r .name "$program_json")"
+program_version="$(jq -r .version "$program_json")"
+
+# image-ref is baked at image-build time; outside the image (e.g. host tests)
+# the file is absent — fall back to "unknown".
+image_ref="unknown"
+if [[ -f "$prog_dir/image-ref.txt" ]]; then
+  image_ref="$(<"$prog_dir/image-ref.txt")"
+fi
+
+# Encode the klee-extra list as a JSON array for the manifest.
+klee_extras_json="$(printf '%s\n' "${klee_extras[@]+"${klee_extras[@]}"}" | jq -R . | jq -s .)"
+
+jq -n \
+  --arg image_ref         "$image_ref" \
+  --arg program           "$program_name" \
+  --arg version           "$program_version" \
+  --arg search            "$search" \
+  --arg max_time          "$max_time" \
+  --arg max_memory        "$max_memory" \
+  --argjson klee_extra    "$klee_extras_json" \
+  --arg bitcode           "$bitcode" \
+  --arg input_sha     "$input_bc_sha256" \
+  --arg baseline_sha  "$baseline_bc_sha256" \
+  --argjson exit      "$klee_exit" \
+  --argjson coverage  "$coverage_json" \
+  --arg trajectory    "$trajectory_file" \
+  '{
+     "image-ref":   $image_ref,
+     program: { name: $program, version: $version },
+     search: $search,
+     runtime: {
+       "max-time":   $max_time,
+       "max-memory": $max_memory,
+       "klee-extra": $klee_extra
+     },
+     bitcode: { path: $bitcode, sha256: $input_sha },
+     "input-bc-sha256":    $input_sha,
+     "baseline-bc-sha256": $baseline_sha,
+     klee: { exit: $exit },
+     coverage: $coverage,
+     "coverage-trajectory": ($trajectory | select(. != "") // null),
+     errors: []
+   }' > "$out/manifest.json"
+
+# Additive stop block — only when early-stop was enabled, so the default
+# fixed-budget manifest stays byte-for-byte unchanged.
+if [[ "$stop_on_plateau" == "1" ]]; then
+  final_ci="$(sqlite3 "$klee_out/run.stats" \
+    "SELECT CoveredInstructions FROM stats ORDER BY rowid DESC LIMIT 1;" 2>/dev/null || true)"
+  [[ "$final_ci" =~ ^[0-9]+$ ]] || final_ci=0
+  stop_json="$(jq -n \
+    --arg     reason  "$stop_reason" \
+    --argjson elapsed "$klee_elapsed" \
+    --arg     window  "$plateau_window" \
+    --argjson ci      "$final_ci" \
+    '{reason: $reason, "elapsed-seconds": $elapsed,
+      plateau: {window: $window, "covered-instructions": $ci}}')"
+  tmp="$(mktemp -p "$out")"
+  jq --argjson stop "$stop_json" '. + {stop: $stop}' "$out/manifest.json" > "$tmp"
+  mv "$tmp" "$out/manifest.json"
+fi
+
+echo "eval-klee: done; manifest at $out/manifest.json" >&2

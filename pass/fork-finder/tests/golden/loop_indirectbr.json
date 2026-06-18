@@ -1,0 +1,82 @@
+{
+  "files": {
+    "loop_indirectbr.c": {
+      "functions": {
+        "dispatch": {
+          "lines": {
+            "12": {
+              "categories": [
+                "Conditional",
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "br",
+                "load",
+                "store"
+              ]
+            },
+            "13": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "load"
+              ]
+            },
+            "15": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "load",
+                "store"
+              ]
+            },
+            "18": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "load",
+                "store"
+              ]
+            },
+            "21": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "load",
+                "store"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "loop_indirectbr.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 1,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 5,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 5,
+    "unlocated_by_category": {
+      "Indirect": 1
+    }
+  }
+}

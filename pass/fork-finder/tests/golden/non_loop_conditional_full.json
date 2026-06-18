@@ -1,0 +1,69 @@
+{
+  "files": {
+    "non_loop_conditional_full.c": {
+      "functions": {
+        "classify": {
+          "lines": {
+            "3": {
+              "categories": [
+                "Conditional",
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "br",
+                "load"
+              ]
+            },
+            "4": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            },
+            "6": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            },
+            "7": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "load"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "non_loop_conditional_full.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 1,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 4,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 4,
+    "unlocated_by_category": {
+      "MemOp": 1
+    }
+  }
+}

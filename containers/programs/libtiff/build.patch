@@ -1,0 +1,21 @@
+--- a/libtiff/tif_codec.c
++++ b/libtiff/tif_codec.c
+@@ -29,6 +29,18 @@
+  */
+ #include "tiffiop.h"
+ 
++/* Undefine optional codec SUPPORT macros so the codec table init
++ * functions redirect to the NotConfigured stub, letting the linker
++ * drop tif_fax3.o, tif_zip.o, tif_luv.o, tif_thunder.o, tif_next.o
++ * (and their math/zlib externs) from the bitcode. Required because
++ * empcs interprocedural data-flow analysis has pathological time
++ * complexity on libtiffs full call graph. */
++#undef CCITT_SUPPORT
++#undef ZIP_SUPPORT
++#undef LOGLUV_SUPPORT
++#undef THUNDER_SUPPORT
++#undef NEXT_SUPPORT
++
+ static int NotConfigured(TIFF *, int);
+ 
+ #ifndef LZW_SUPPORT

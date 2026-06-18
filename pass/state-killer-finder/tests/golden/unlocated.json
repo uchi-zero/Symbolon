@@ -1,0 +1,35 @@
+{
+  "files": {},
+  "module": "unlocated.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "CallArityMismatch": 0,
+      "ExternCallIndirect": 0,
+      "ExternCallSymArg": 0,
+      "ExternCallSymPtr": 0,
+      "FreeOfNonHeap": 0,
+      "IndirectBranch": 0,
+      "InlineAsm": 0,
+      "ProgramTerminator": 0,
+      "SymbolicAllocSize": 0,
+      "SymbolicVectorIndex": 0,
+      "UnimplementedIntrinsic": 0,
+      "UnreachableInstruction": 0,
+      "UnsupportedInstruction": 0
+    },
+    "by_severity": {
+      "conditional": 0,
+      "definite": 0,
+      "likely": 0
+    },
+    "total_findings": 0,
+    "unlocated_by_category": {
+      "ExternCallSymArg": 1,
+      "InlineAsm": 1
+    },
+    "unlocated_by_severity": {
+      "likely": 2
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "files": {},
+  "module": "direct_call.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 0,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 0,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 0
+  }
+}

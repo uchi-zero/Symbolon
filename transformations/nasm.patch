@@ -1,0 +1,40 @@
+--- a/asm/nasm.c	2026-06-09 07:04:17.842156112 +0000
++++ b/asm/nasm.c	2026-06-09 07:03:49.727517412 +0000
+@@ -523,6 +523,37 @@
+         return 1;
+     }
+ 
++#ifdef KLEE_BITCODE
++    /*
++     * input-menu-pin on the output-format selector.
++     *
++     * The symbolic environment is `--sym-args 0 2 2` (0-2 args, each <=2
++     * chars), so KLEE's symbolic argv can never spell a `-f <format>` name
++     * (every backend shortname is >=3 chars). Without `-f`, `ofmt` stays at
++     * OF_DEFAULT (of_bin), so every other backend driver (outelf/outobj/
++     * outmacho/outcoff/outaout/outieee/outas86) is statically reachable but
++     * dynamically blocked -- those modules dominate the uncovered fork/killer
++     * hotspots. Fork once, concretely, over a menu of backend shortnames and
++     * resolve each through the program's own ofmt_find(), so a single KLEE run
++     * routes one state into each output backend. Pin happens before the
++     * ofmt->default_dfmt resolution below, so dfmt follows the chosen backend.
++     */
++    {
++        static const char *const fmt_menu[] = {
++            "bin", "elf32", "elf64", "obj", "macho64",
++            "coff", "aout", "ieee", "as86",
++        };
++        const unsigned fmt_n = sizeof(fmt_menu) / sizeof(fmt_menu[0]);
++        unsigned fmt_sel = (unsigned) klee_range(0, fmt_n, "__ofmt_menu");
++        const struct ofmt_alias *menu_alias = NULL;
++        const struct ofmt *menu_ofmt = ofmt_find(fmt_menu[fmt_sel], &menu_alias);
++        if (menu_ofmt) {
++            ofmt = menu_ofmt;
++            ofmt_alias = menu_alias;
++        }
++    }
++#endif
++
+     /* At this point we have ofmt and the name of the desired debug format */
+     if (!using_debug_info) {
+         /* No debug info, redirect to the null backend (empty stubs) */

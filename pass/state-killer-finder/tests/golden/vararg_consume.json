@@ -1,0 +1,16 @@
+{
+  "files": {},
+  "module": "vararg_consume.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "UnsupportedInstruction": 0
+    },
+    "by_severity": {
+      "conditional": 0,
+      "definite": 0,
+      "likely": 0
+    },
+    "total_findings": 0
+  }
+}

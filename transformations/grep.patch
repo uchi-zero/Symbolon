@@ -1,0 +1,68 @@
+--- a/src/grep.c	2026-06-06 11:06:11.625335551 +0000
++++ b/src/grep.c	2026-06-06 11:08:28.246348732 +0000
+@@ -50,6 +50,9 @@
+ #include "xalloc.h"
+ #include "xbinary-io.h"
+ #include "xstrtol.h"
++#ifdef KLEE_BITCODE
++# include <klee/klee.h>
++#endif
+ 
+ enum { SEP_CHAR_SELECTED = ':' };
+ enum { SEP_CHAR_REJECTED = '-' };
+@@ -2857,6 +2860,55 @@
+          script uses the non-POSIX "grep '\-x'" to avoid treating
+          '-x' as an option.  */
+       char const *pat = argv[optind++];
++#ifdef KLEE_BITCODE
++      /* input-menu-pin (regex operand): generalizes r1's single "ab" pin.
++         The symEnv makes the pattern operand a symbolic argv string, which
++         drives GEAcompile()'s lexer/parser/DFA-builder in lib/dfa.c -- the
++         dominant fork hotspot (lex 186, dfamust 128, build_state 109,
++         parse_bracket_exp 104, dfaanalyze 95).  r1 pinned ONE trivial BRE
++         ("ab") so GEAcompile ran concrete, but that compiles only the
++         literal-concatenation path: the baseline's random-path searcher
++         had covered varied regex shapes, so r1 cost it dfa.c -149.
++
++         Recover that breadth in ONE run: pick the operand from a menu of
++         regex shapes by a symbolic klee_range.  KLEE forks once on the
++         selector; each fork pins the operand to a distinct concrete
++         pattern, so the dfa.c lexer/parser sees the STAR closure, the
++         ANYCHAR period, and the BEGLINE anchor -- not just two literals --
++         while every compile stays fork-free.  klee_assume records the
++         bytes on the symbolic argv object, so each emitted ktest replays
++         the exact `grep '<entry>' A` on the native oracle.
++
++         Buffer-size constraint (from the r1 ktests): with --sym-args 0 2 2
++         the operand grep selects (argv[optind]) can be a 3-byte short-arg
++         buffer (max 2 content chars), not only the 11-byte --sym-arg slot.
++         Touching pat[i] for i>2 would be out of bounds on those states, so
++         every menu entry is exactly 2 content chars + NUL -- in bounds for
++         every argv slot, yet each selects a different dfa.c token kind.
++
++         Trade-off: still forfeits >2-char features (bracket classes,
++         alternation needs -E, backrefs); a -F cohort (r3) and -E
++         alternation remain separate leads.  Guarded by KLEE_BITCODE so the
++         native coverage binary never sees klee_range / klee_assume. */
++      {
++        static char const *const klee_pat_menu[] = {
++          "ab",   /* two literals: concatenation (r1's shape)        */
++          "a*",   /* STAR closure over a literal                     */
++          "a.",   /* literal then ANYCHAR (period)                   */
++          ".*",   /* ANYCHAR closure: matches anything               */
++          "^a",   /* BEGLINE anchor then literal                     */
++          "a$",   /* literal then ENDLINE anchor                     */
++        };
++        enum { KLEE_PAT_N = sizeof klee_pat_menu / sizeof klee_pat_menu[0] };
++        unsigned sel = (unsigned) klee_range (0, KLEE_PAT_N, "regex_menu_sel");
++        char const *mp = klee_pat_menu[0];
++        for (unsigned k = 1; k < KLEE_PAT_N; k++)
++          if (sel == k) mp = klee_pat_menu[k];   /* concrete in each fork */
++        klee_assume (pat[0] == mp[0]);
++        klee_assume (pat[1] == mp[1]);
++        klee_assume (pat[2] == '\0');
++      }
++#endif
+       bool skip_bs = (matcher != F_MATCHER_INDEX
+                       && pat[0] == '\\' && pat[1] == '-');
+ 

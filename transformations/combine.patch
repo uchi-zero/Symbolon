@@ -1,0 +1,260 @@
+--- a/src/main.c	2026-06-07 01:58:49.883499868 +0000
++++ b/src/main.c	2026-06-07 01:53:17.094020635 +0000
+@@ -31,6 +31,18 @@
+ #include "process_files.h"
+ #include "iguile.h"
+ 
++#ifdef KLEE_BITCODE
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/stat.h>
++/* KLEE intrinsics, declared weak so the bc-pass native link (which only feeds
++ * gllvm's get-bc) resolves them to 0 regardless of -lklee-stubs archive order;
++ * KLEE intercepts the real calls by name in the extracted bitcode. The native
++ * coverage binary is compiled WITHOUT -DKLEE_BITCODE, so it never sees these. */
++extern int  klee_range (int begin, int end, const char *name) __attribute__((weak));
++extern void klee_assume (unsigned long condition) __attribute__((weak));
++#endif
++
+ /********
+  * Start guile and then run our program.
+  */
+@@ -104,6 +116,217 @@
+ 
+   exit_status = 0;
+ 
++#ifdef KLEE_BITCODE
++  /* input-menu-pin (transformations/path-explosion/input-menu-pin):
++   *
++   * Harness: "--sym-args 0 2 4 A B --sym-files 2 50".  KLEE reconstructs argv
++   * as { prog, [arg00], [arg01], "A", "B" } -- 0..2 leading symbolic option
++   * words of <=4 chars each, then the two concrete data-file names A and B
++   * whose 50-byte bodies are symbolic.  Left free, KLEE drowns in getopt_long
++   * and the df_get_next_record / dstrstr delimiter scan over the symbolic file
++   * bytes and never assembles a valid reference-matching invocation; the
++   * baseline plateaus near 920 lines with the data engine almost untouched
++   * (process_files.c 84/1670, hash.c 0/134, write_files.c 0/96).
++   *
++   * Remedy: pin the run to one of a menu of COMPLETE, VALID combine command
++   * lines, selected by a single symbolic klee_range.  Three pins per branch:
++   *   1. argc == 5 (the n_args == 2 branch), asserted BEFORE the menu fork so
++   *      the menu only forks on the surviving valid path (else every argc-3/4
++   *      state dies on the assume without doing work);
++   *   2. the two <=4-char option words (klee_assume on argv bytes) -- we
++   *      CONSTRAIN the real symbolic argv rather than overwrite the pointer, so
++   *      the ktest records the exact command line;
++   *   3. S_ISREG on each file's stat AND the 50-byte body.  The stat pin is
++   *      essential: without it KLEE leaves a file's st_mode symbolic and picks
++   *      S_IFCHR, so klee-replay materializes it as a pty instead of a disk
++   *      file and combine's fopen() of the reference file reads a 0-length tty
++   *      and dies with "File: Input/output error" -- losing all engine coverage
++   *      on replay.  Pinning S_ISREG makes klee-replay write both files to disk.
++   *
++   * KLEE forks once on the selector and drives every branch to a clean exit in
++   * ONE run (one bitcode, one manifest.json -- never a cross-run profraw union);
++   * the native cov binary (plain df_main, no KLEE_BITCODE) reproduces each
++   * engine path on replay.  Entries exercise distinct reachable features:
++   * reference key-match + check-all (-rB -R), count (-n), write-reference-output
++   * (-w, write_files.c), optional / exclude match (-p/-P), unique (-u), verbose
++   * (-v), flag (-f), hierarchy leaf-only / up-hierarchy (-l/-U), reference =
++   * file A vs B, and the join emulation (-e join).  Guarded by KLEE_BITCODE so
++   * the cov binary never sees the klee_range / klee_assume intrinsics. */
++  {
++    /* r5: MINIMAL 50-byte bodies.  r4 showed coverage of the dominant `-e join`
++     * branch comes almost entirely from handle_join_arguments + the shared
++     * engine setup (tiny 1-record data covers 1415 of join's 1432 lines), NOT
++     * from iterating many records.  Shrinking every entry's data to 1-2 tiny
++     * records keeps the per-branch coverage but makes each branch CHEAP to run
++     * to completion -- so breadth-first / empc can finish all branches of the
++     * wide fork within budget instead of stalling in a deep join (the r4
++     * regression: bfs/empc 1693/1640 -> 1352/1297 because the 28-branch fork
++     * starved the deep join).  Two tiny records, last field 'z'-padded so no
++     * empty/partial record trips a field-count check; the rest is trailing
++     * newlines (empty records combine reads and skips cheaply). */
++    static const char W1[50] = "a\nbz\n";
++    static const char W2[50] = "a\ncz\n";
++    static const char J1[50] = "a 1\n";   /* join: 1 matching record each (1415 lines) */
++    static const char J2[50] = "a 2\n";
++    static const char E1[50] = "\n\naz\n"; /* leading empty records (zero-length path) */
++    static const char E2[50] = "\n\nbz\n";
++    /* r22: hierarchy data to DRIVE traverse_hierarchy / hrchy_add_path (not just
++     * parse the -a option).  traverse_hierarchy fires only when -a gives a valid
++     * hierarchy-key range AND a data record MATCHES a reference key (keep_match
++     * == 1, hash_index != -1).  So both files must share a whole-record key.
++     * H1 (data, file A) and H2 (reference, file B) share the record "a b" so the
++     * match succeeds; field 1 (-a1) is the hierarchy key. */
++    static const char H1[50] = "a b\n";
++    static const char H2[50] = "a b\n";
++    /* r23: multi-field MATCHING data to drive write_match_record's output loop.
++     * M1 (data, file A) and M2 (reference, file B) share key field "a" and carry
++     * extra fields, so a -o1 (data output field 1) match writes fields through
++     * the gi_data_out_range_count>0 branch (581 uncovered regions in
++     * write_match_record). Space-delimited (combine's default field delimiter). */
++    static const char M1[50] = "a x y\nb p q\n";
++    static const char M2[50] = "a x y\nb p q\n";
++    /* r24: data-side -p (before -r) sets gi_data_optional_ind; -rB then binds a
++     * reference whose record "q r s" the data "a m n" never matches, so the
++     * unmatched-reference optional-write loop (process_files.c 499-512) fires. */
++    static const char P1[50] = "a m n\n";
++    static const char P2[50] = "a m n\nq r s\n";
++
++    struct combine_menu_entry {
++      const char *o0;
++      const char *o1;
++      const char *a;
++      const char *b;
++    };
++    /* r3: ordered by descending UNIQUE (disjoint) coverage, richest first.
++     * The single klee_range fork is explored by each searcher in a different,
++     * scheduling-dependent order before the 10-min plateau; r1/r2 showed bfs
++     * could miss the dominant `-e join` branch entirely (banking ~1005) while
++     * a luckier searcher that hit join banked ~1497.  Front-loading the
++     * high-unique-coverage branches (join ~1432, then the engine, then the cut
++     * / M / empty error-and-edge paths) makes greedy (nurs:md2u) and
++     * breadth-first (bfs) searchers reach the big slices early instead of
++     * exhausting budget on the redundant `-rB -*` family (each ~830 lines,
++     * heavily overlapping).  The redundant family is kept but moved last so a
++     * searcher that does sweep still gets their small marginal lines. */
++    static const struct combine_menu_entry combine_menu[] = {
++      { "-e", "join", J1, J2 },  /* richest single entry (~1432): join engine    */
++      { "-rB", "-a1", H1, H2 },  /* r22: hierarchy MATCH+traverse (traverse_hierarchy/hrchy_add_path) */
++      { "-rB", "-o1", M1, M2 },  /* r23: matched multi-field output (write_match_record output loop) */
++      { "-rB", "-O1", M1, M2 },  /* r23b: output-field RANGE on matched data (gi_data_out_range_count loop) */
++      { "-rB", "-s1", M1, M2 },  /* r23b: sum field on matched multi-field data (sum/counter write path) */
++      { "-p", "-rB", P1, P2 },   /* r24: data -p + reference -> unmatched-ref optional WRITE (process_files.c 499-512) */
++      { "-rA", "-rB", M1, M2 },  /* r25: TWO reference files -> process_data_reference_matches recursion (+4) */
++      { "-P", "-rB", M1, M2 },   /* r25: data-side -P exclude (before -r) -> gi_data_exclude_match_ind write-suppression (+2) */
++      { "-rB", "-v", W1, W2 },   /* reference key-match + verbose request dump    */
++      { "-rB", "-w", W1, W2 },   /* write reference output (write_files.c)        */
++      { "-e", "cut", W1, W2 },   /* cut emulation arg-parse (handle_cut_arguments)*/
++      { "-rB", "-M", W1, W2 },   /* data-is-reference single-pass (error path)    */
++      { "-rB", "-n", E1, E2 },   /* empty leading records (zero-length-record)    */
++      /* r4: single-option-argument parse branches.  Each `-rB -X<arg>` (one
++       * <=4-char word) drives option X's value parser in set_file_option /
++       * set_general_option / calculate_ranges -- field-range, delimiter,
++       * record-length, output-file, constant, hash/counter-size parsing the
++       * earlier menu never touched.  Ordered by descending unique coverage
++       * (offline union 1689 -> ~1857, +168).  Some terminate via FATAL_ERROR
++       * (still emit a ktest exercising the parse + error report). */
++      { "-rB", "-o9", W1, W2 },  /* output-field range parse (calculate_ranges)   */
++      { "-rB", "-L9", W1, W2 },  /* input-record-length parse                     */
++      { "-rB", "-s9", W1, W2 },  /* sum-field range parse                         */
++      { "-rB", "-B.", W1, W2 },  /* input-record-delimiter parse                  */
++      { "-rB", "-D.", W1, W2 },  /* input-field-delimiter parse                   */
++      { "-rB", "-O9", W1, W2 },  /* field-order spec parse (parse field order)    */
++      { "-rB", "-tA", W1, W2 },  /* output-file open path                         */
++      { "-rB", "-Kx", W1, W2 },  /* output-constant string                        */
++      { "-rB", "-h9", W1, W2 },  /* hash-size parse                               */
++      { "-rB", "-z9", W1, W2 },  /* counter-size parse                            */
++      { "-rB", "-d.", W1, W2 },  /* output-field-delimiter parse                  */
++      { "-rB", "-b.", W1, W2 },  /* output-record-delimiter parse                 */
++      /* r5: the remaining single-option-argument parse branches (key / data-key
++       * / hierarchy-key field-range parse, emulation-arg dispatch error,
++       * hash-movement, extension, counter).  Each 2 words; offline union
++       * 1857 -> ~1996. */
++      { "-rB", "-e9", W1, W2 },  /* emulate-arg dispatch (unknown emulation error)*/
++      { "-rB", "-a9", W1, W2 },  /* hierarchy-key field-range parse               */
++      { "-rB", "-k9", W1, W2 },  /* key-fields range parse                        */
++      { "-rB", "-m9", W1, W2 },  /* data-key-fields range parse                   */
++      { "-rB", "-H9", W1, W2 },  /* hash-movement option                          */
++      { "-rB", "-x9", W1, W2 },  /* extension option                              */
++      { "-rB", "-X9", W1, W2 },  /* extension-init-file option                    */
++      { "-rB", "-F9", W1, W2 },  /* flatten-hierarchy option                      */
++      { "-rB", "-P", W1, W2 },   /* exclude match                                 */
++      { "-rB", "-U", W1, W2 },   /* up-hierarchy                                  */
++      { "-rB", "-p", W1, W2 },   /* optional match                                */
++      { "-rB", "-l", W1, W2 },   /* hierarchy leaf-only                           */
++      { "-rB", "-u", W1, W2 },   /* unique keys                                   */
++      { "-rB", "-n", W1, W2 },   /* count                                         */
++      { "-rB", "-R", W1, W2 },   /* check-all-reference                           */
++      { "-rB", "-f", W1, W2 },   /* flag                                          */
++      { "-rA", "-R", W1, W2 },   /* reference=A key-match + check-all             */
++      { "-rA", "-n", W1, W2 },   /* reference=A count                             */
++    };
++    enum { COMBINE_NMENU = sizeof (combine_menu) / sizeof (combine_menu[0]) };
++
++    /* Pin argc to the n_args==2 branch FIRST, so the menu fork only happens on
++     * the surviving valid path. */
++    klee_assume (argc == 5);
++
++    {
++      unsigned sel = (unsigned) klee_range (0, COMBINE_NMENU, "combine_menu_sel");
++      const struct combine_menu_entry *e = &combine_menu[0];
++      unsigned mk;
++      struct stat stbuf;
++      for (mk = 1; mk < (unsigned) COMBINE_NMENU; mk++)
++	if (sel == mk)
++	  e = &combine_menu[mk];
++
++      /* Constrain the two symbolic option words to this entry's bytes. */
++      {
++	const char *w = e->o0;
++	int i;
++	for (i = 0; w[i] != '\0'; i++)
++	  klee_assume (argv[1][i] == w[i]);
++	klee_assume (argv[1][i] == '\0');
++      }
++      {
++	const char *w = e->o1;
++	int i;
++	for (i = 0; w[i] != '\0'; i++)
++	  klee_assume (argv[2][i] == w[i]);
++	klee_assume (argv[2][i] == '\0');
++      }
++
++      /* Pin both files to regular-file stat so klee-replay writes them to disk
++       * (not a pty), then pin the 50-byte bodies so the ktest replays exactly. */
++      if (stat ("A", &stbuf) == 0) klee_assume (S_ISREG (stbuf.st_mode));
++      if (stat ("B", &stbuf) == 0) klee_assume (S_ISREG (stbuf.st_mode));
++      {
++	int fd = open ("A", O_RDONLY);
++	if (fd >= 0) {
++	  unsigned char buf[50];
++	  int n = read (fd, buf, 50);
++	  int j;
++	  close (fd);
++	  if (n == 50)
++	    for (j = 0; j < 50; j++)
++	      klee_assume (buf[j] == (unsigned char) e->a[j]);
++	}
++      }
++      {
++	int fd = open ("B", O_RDONLY);
++	if (fd >= 0) {
++	  unsigned char buf[50];
++	  int n = read (fd, buf, 50);
++	  int j;
++	  close (fd);
++	  if (n == 50)
++	    for (j = 0; j < 50; j++)
++	      klee_assume (buf[j] == (unsigned char) e->b[j]);
++	}
++      }
++    }
++  }
++#endif /* KLEE_BITCODE */
++
+   initialize_variables (argc, argv);
+ 
+   handle_arguments (argc, argv);
+--- a/src/dstring.c	2026-06-07 01:58:49.884499851 +0000
++++ b/src/dstring.c	2026-06-07 01:53:16.935023274 +0000
+@@ -665,8 +665,16 @@
+     unsigned char *curr_substring_pos;
+ 
+     curr_substring_pos = substring->string;
+-    while (*curr_substring_pos == *curr_string_pos
+-	   && curr_substring_pos < substring->string + substring->length) {
++    /* KLEE state-killer fix: check the substring bound BEFORE dereferencing
++     * curr_substring_pos.  The original order reads *curr_substring_pos one
++     * element past the end before the < end test short-circuits; the native
++     * binary tolerates the 1-byte over-read (allocated slack), but KLEE's
++     * precise memory model flags it as an out-of-bound error and kills the
++     * state mid-record-scan -- dstrstr is on the per-record hot path, so every
++     * engine path dies there.  Reordering the && is semantics-preserving (the
++     * loop already intends to stop at the bound). */
++    while (curr_substring_pos < substring->string + substring->length
++	   && *curr_substring_pos == *curr_string_pos) {
+       curr_substring_pos++;
+       curr_string_pos++;
+       }

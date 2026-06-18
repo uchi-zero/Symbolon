@@ -1,0 +1,27 @@
+{
+  "files": {
+    "nested_if.c": {
+      "branch_count": 2,
+      "branches": [
+        {
+          "line": 3,
+          "opcode": "br",
+          "outcomes": 2
+        },
+        {
+          "line": 4,
+          "opcode": "br",
+          "outcomes": 2
+        }
+      ],
+      "outcome_count": 4
+    }
+  },
+  "module": "nested_if.bc",
+  "schema_version": 1,
+  "summary": {
+    "total_branches": 2,
+    "total_files": 1,
+    "total_outcomes": 4
+  }
+}

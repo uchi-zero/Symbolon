@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# cov-trajectory — build a (t_seconds, lines_covered, ktests_so_far) CSV
+# from a populated klee-out + profraw dir, sampled at a fixed interval with
+# dedup of flat windows.
+
+# @option --from-eval-klee-out      Convenience: infer --klee-out, --profraw-dir, --max-time-seconds from an eval-klee output dir.
+# @option --klee-out                KLEE --output-dir whose ktest mtimes drive sampling.
+# @option --profraw-dir             Directory of one .profraw per replayed ktest.
+# @option --binary!                 Instrumented oracle binary (program.cov).
+# @option --max-time-seconds        Run budget in seconds (final anchor row sits at this t).
+# @option --klee-start-epoch        Override start-time autodetect (Unix seconds).
+# @option --sample-every=5m         Tick interval (Ns/Nm/Nh).
+# @option --out!                    Output CSV path.
+
+set -euo pipefail
+eval "$(argc --argc-eval "$0" "$@")"
+
+from_dir="${argc_from_eval_klee_out:-}"
+klee_out="${argc_klee_out:-}"
+profraw_dir="${argc_profraw_dir:-}"
+binary="$argc_binary"
+max_time_seconds="${argc_max_time_seconds:-}"
+klee_start_epoch="${argc_klee_start_epoch:-}"
+sample_every="$argc_sample_every"
+out="$argc_out"
+
+if [[ -z "$from_dir" ]]; then
+  for var in klee_out profraw_dir max_time_seconds; do
+    if [[ -z "${!var}" ]]; then
+      echo "cov-trajectory: --${var//_/-} is required when --from-eval-klee-out is not set" >&2
+      exit 2
+    fi
+  done
+fi
+
+# --- Convert sample_every to integer seconds ---
+to_seconds() {
+  local v="$1"
+  case "$v" in
+    *s) echo "${v%s}" ;;
+    *m) echo $(( ${v%m} * 60 )) ;;
+    *h) echo $(( ${v%h} * 3600 )) ;;
+    *d) echo $(( ${v%d} * 86400 )) ;;
+    *)  echo "$v" ;;
+  esac
+}
+
+if [[ -n "$from_dir" ]]; then
+  [[ -d "$from_dir" ]] || { echo "cov-trajectory: --from-eval-klee-out dir not found: $from_dir" >&2; exit 2; }
+  : "${klee_out:=$from_dir/klee-out}"
+  : "${profraw_dir:=$from_dir/profraw}"
+  if [[ -z "$max_time_seconds" ]]; then
+    [[ -s "$from_dir/manifest.json" ]] || { echo "cov-trajectory: $from_dir/manifest.json missing; cannot infer --max-time-seconds" >&2; exit 2; }
+    mt_str="$(jq -r '.runtime["max-time"] // empty' "$from_dir/manifest.json")"
+    [[ -n "$mt_str" ]] || { echo "cov-trajectory: $from_dir/manifest.json has no runtime.max-time" >&2; exit 2; }
+    max_time_seconds="$(to_seconds "$mt_str")"
+  fi
+  if [[ -z "$klee_start_epoch" && -s "$from_dir/klee-start-epoch.txt" ]]; then
+    klee_start_epoch="$(cat "$from_dir/klee-start-epoch.txt")"
+  fi
+fi
+
+# --- Resolve klee_start_epoch from priority chain if not yet set ---
+if [[ -z "$klee_start_epoch" ]]; then
+  if [[ -s "$klee_out/info" ]]; then
+    started_line="$(grep -m1 '^Started:' "$klee_out/info" || true)"
+    if [[ -n "$started_line" ]]; then
+      ts="$(echo "$started_line" | sed 's/^Started:[[:space:]]*//')"
+      klee_start_epoch="$(date -d "$ts" +%s 2>/dev/null || true)"
+    fi
+    if [[ -z "$klee_start_epoch" ]]; then
+      klee_start_epoch="$(stat -c %Y "$klee_out/info")"
+    fi
+  fi
+fi
+if [[ -z "$klee_start_epoch" ]]; then
+  shopt -s nullglob
+  earliest_kts=("$klee_out"/*.ktest)
+  shopt -u nullglob
+  if (( ${#earliest_kts[@]} > 0 )); then
+    klee_start_epoch="$(stat -c %Y "${earliest_kts[0]}")"
+    for f in "${earliest_kts[@]}"; do
+      mt=$(stat -c %Y "$f")
+      (( mt < klee_start_epoch )) && klee_start_epoch=$mt
+    done
+    echo "cov-trajectory: warn: no info file or sidecar; using earliest ktest mtime as t=0" >&2
+  fi
+fi
+if [[ -z "$klee_start_epoch" ]]; then
+  echo "cov-trajectory: could not determine KLEE start epoch (no flag, sidecar, info file, or ktests)" >&2
+  exit 2
+fi
+
+sample_every_s=$(to_seconds "$sample_every")
+(( sample_every_s > 0 )) || { echo "cov-trajectory: --sample-every must be > 0" >&2; exit 2; }
+
+# --- CSV schema ---
+# Columns: t_seconds, then five llvm-cov metrics (functions, instantiations,
+# lines, regions, branches), then ktests_so_far. Totals (constants for a
+# binary) live in manifest.json's coverage block, not here.
+ZERO_METRICS="0,0,0,0,0"
+
+mkdir -p "$(dirname "$out")"
+{
+  echo "t_seconds,functions_covered,instantiations_covered,lines_covered,regions_covered,branches_covered,ktests_so_far"
+  echo "0,${ZERO_METRICS},0"
+} > "$out"
+
+# --- Enumerate ktests sorted by mtime ---
+shopt -s nullglob
+ktest_files=("$klee_out"/*.ktest)
+shopt -u nullglob
+
+if (( ${#ktest_files[@]} == 0 )); then
+  echo "${max_time_seconds},${ZERO_METRICS},0" >> "$out"
+  echo "cov-trajectory: no ktests found; wrote anchor-only CSV to $out" >&2
+  exit 0
+fi
+
+# --- Build chronological (elapsed_seconds, profraw) list ---
+elapsed=()
+profraws=()
+for f in "${ktest_files[@]}"; do
+  name="$(basename "$f" .ktest)"
+  pr="$profraw_dir/$name.profraw"
+  if [[ ! -s "$pr" ]]; then
+    echo "cov-trajectory: warn: missing/empty profraw for $name; skipping" >&2
+    continue
+  fi
+  mt=$(stat -c %Y "$f")
+  e=$(( mt - klee_start_epoch ))
+  (( e < 0 )) && e=0
+  elapsed+=("$e")
+  profraws+=("$pr")
+done
+
+if (( ${#elapsed[@]} > 0 )); then
+  mapfile -t sorted_idx < <(
+    for i in "${!elapsed[@]}"; do
+      printf '%d %d\n' "${elapsed[$i]}" "$i"
+    done | sort -n -k1,1 -s | awk '{print $2}'
+  )
+  s_elapsed=()
+  s_profraws=()
+  for i in "${sorted_idx[@]}"; do
+    s_elapsed+=("${elapsed[$i]}")
+    s_profraws+=("${profraws[$i]}")
+  done
+  elapsed=("${s_elapsed[@]}")
+  profraws=("${s_profraws[@]}")
+fi
+
+# --- Sample-walk with incremental merge + dedup ---
+running_profdata="$(mktemp -p "$(dirname "$out")" .cov-traj.XXXXXX.profdata)"
+trap 'rm -f "$running_profdata" "$running_profdata.next"' EXIT
+: > "$running_profdata"
+
+merge_into_running() {  # args: profraw...
+  if [[ ! -s "$running_profdata" ]]; then
+    llvm-profdata merge -sparse -o "$running_profdata" "$@"
+  else
+    llvm-profdata merge -sparse -o "$running_profdata.next" \
+      "$running_profdata" "$@"
+    mv "$running_profdata.next" "$running_profdata"
+  fi
+}
+
+# Emit five comma-separated covered counts in CSV order:
+# functions, instantiations, lines, regions, branches.
+extract_metrics() {
+  local out
+  out="$(
+    llvm-cov export --instr-profile "$running_profdata" --format=text --summary-only "$binary" \
+      | jq -r '
+        .data[0].totals as $t |
+        [
+          $t.functions.covered,
+          $t.instantiations.covered,
+          $t.lines.covered,
+          $t.regions.covered,
+          $t.branches.covered
+        ] | map(if . == null then 0 else . end) | join(",")
+      '
+  )"
+  case "$out" in ''|*[!0-9,]*) out="$ZERO_METRICS" ;; esac
+  echo "$out"
+}
+
+prev_metrics="$ZERO_METRICS"
+included=0
+n=${#elapsed[@]}
+
+# Walk ticks t = sample_every_s, 2*sample_every_s, ..., max_time_seconds.
+t=$sample_every_s
+while (( t < max_time_seconds )); do
+  new_count=$included
+  while (( new_count < n )) && (( elapsed[new_count] <= t )); do
+    new_count=$((new_count + 1))
+  done
+
+  if (( new_count == included )); then
+    t=$((t + sample_every_s))
+    continue
+  fi
+
+  new_profraws=()
+  for ((j=included; j<new_count; j++)); do
+    new_profraws+=("${profraws[$j]}")
+  done
+  merge_into_running "${new_profraws[@]}"
+  included=$new_count
+
+  metrics="$(extract_metrics)"
+  if [[ "$metrics" != "$prev_metrics" ]]; then
+    echo "${t},${metrics},${included}" >> "$out"
+    prev_metrics="$metrics"
+  fi
+
+  t=$((t + sample_every_s))
+done
+
+# --- Final anchor row at t=max_time_seconds (always emit) ---
+final_count=$included
+while (( final_count < n )) && (( elapsed[final_count] <= max_time_seconds )); do
+  final_count=$((final_count + 1))
+done
+
+if (( final_count > included )); then
+  new_profraws=()
+  for ((j=included; j<final_count; j++)); do
+    new_profraws+=("${profraws[$j]}")
+  done
+  merge_into_running "${new_profraws[@]}"
+  included=$final_count
+  final_metrics="$(extract_metrics)"
+else
+  # No new ktests in the final window — reuse last emitted value.
+  final_metrics="$prev_metrics"
+fi
+
+echo "${max_time_seconds},${final_metrics},${included}" >> "$out"
+
+echo "cov-trajectory: wrote $out (ktests included=$included)" >&2

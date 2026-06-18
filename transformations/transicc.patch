@@ -1,0 +1,96 @@
+--- a/src/cmscgats.c
++++ b/src/cmscgats.c
+@@ -32,20 +32,73 @@
+-static const char cms_klee_cgats[] =
+-    "CGATS.17\n"
+-    "NUMBER_OF_FIELDS 4\n"
+-    "BEGIN_DATA_FORMAT\n"
+-    "SAMPLE_ID RGB_R RGB_G RGB_B\n"
+-    "END_DATA_FORMAT\n"
+-    "NUMBER_OF_SETS 1\n"
+-    "BEGIN_DATA\n"
+-    "P0 0 128 255\n"
+-    "END_DATA\n";
+-static cmsUInt32Number cms_klee_cgats_pos = 0;
+-
+-static
+-cmsUInt8Number cms_klee_pin_cgats_byte(cmsUInt8Number value, cmsUInt32Number pos)
+-{
+-    cmsUInt32Number len = (cmsUInt32Number) (sizeof(cms_klee_cgats) - 1);
+-    cmsUInt8Number expected = (pos < len) ? (cmsUInt8Number) cms_klee_cgats[pos] : (cmsUInt8Number) '\n';
+-    klee_assume(value == expected);
+-    return expected;
+-}
++static const char *const cms_klee_cgats_menu[] = {
++    "CGATS.17\n"
++    "NUMBER_OF_FIELDS 4\n"
++    "BEGIN_DATA_FORMAT\n"
++    "SAMPLE_ID RGB_R RGB_G RGB_B\n"
++    "END_DATA_FORMAT\n"
++    "NUMBER_OF_SETS 1\n"
++    "BEGIN_DATA\n"
++    "P0 0 128 255\n"
++    "END_DATA\n",
++    "CGATS.17\n"
++    "NUMBER_OF_FIELDS 4\n"
++    "BEGIN_DATA_FORMAT\n"
++    "SAMPLE_ID LAB_L LAB_A LAB_B\n"
++    "END_DATA_FORMAT\n"
++    "NUMBER_OF_SETS 1\n"
++    "BEGIN_DATA\n"
++    "P0 50 0 0\n"
++    "END_DATA\n",
++    "CGATS.17\n"
++    "NUMBER_OF_FIELDS 4\n"
++    "BEGIN_DATA_FORMAT\n"
++    "SAMPLE_ID XYZ_X XYZ_Y XYZ_Z\n"
++    "END_DATA_FORMAT\n"
++    "NUMBER_OF_SETS 1\n"
++    "BEGIN_DATA\n"
++    "P0 20 21 22\n"
++    "END_DATA\n",
++    "CGATS.17\n"
++    "NUMBER_OF_FIELDS 5\n"
++    "BEGIN_DATA_FORMAT\n"
++    "SAMPLE_ID CMYK_C CMYK_M CMYK_Y CMYK_K\n"
++    "END_DATA_FORMAT\n"
++    "NUMBER_OF_SETS 1\n"
++    "BEGIN_DATA\n"
++    "P0 0 0.25 0.5 0.75\n"
++    "END_DATA\n"
++};
++static int cms_klee_cgats_variant = -1;
++static cmsUInt32Number cms_klee_cgats_pos = 0;
++
++static
++const char* cms_klee_cgats_selected(void)
++{
++    if (cms_klee_cgats_variant < 0)
++        cms_klee_cgats_variant = klee_range(0, 4, "transicc_r5_cgats_menu");
++
++    switch (cms_klee_cgats_variant) {
++    case 1: return cms_klee_cgats_menu[1];
++    case 2: return cms_klee_cgats_menu[2];
++    case 3: return cms_klee_cgats_menu[3];
++    default: return cms_klee_cgats_menu[0];
++    }
++}
++
++static
++cmsUInt32Number cms_klee_cgats_len(const char* text)
++{
++    cmsUInt32Number len = 0;
++    while (text[len] != '\0')
++        len++;
++    return len;
++}
++
++static
++cmsUInt8Number cms_klee_pin_cgats_byte(cmsUInt8Number value, cmsUInt32Number pos)
++{
++    const char* text = cms_klee_cgats_selected();
++    cmsUInt32Number len = cms_klee_cgats_len(text);
++    cmsUInt8Number expected = (pos < len) ? (cmsUInt8Number) text[pos] : (cmsUInt8Number) '\n';
++    klee_assume(value == expected);
++    return expected;
++}

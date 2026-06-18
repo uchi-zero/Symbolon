@@ -1,0 +1,71 @@
+--- a/src/main.c	2026-06-06 09:45:35.467759011 +0000
++++ b/src/main.c	2026-06-06 09:46:11.729585035 +0000
+@@ -268,6 +268,57 @@
+   jv_free(input);
+ }
+ 
++#ifdef KLEE_BITCODE
++/* input-menu-pin (skills/code-transformation authoring-patterns.md): jq's first
++   symbolic argv is the *filter program* and must clear lexer -> parser ->
++   compile before the bytecode interpreter (execute.c), the builtins
++   (builtin.c) and the value engine (jv.c) ever run. With argv fully symbolic
++   KLEE drowns in the lexer/parser fork explosion (parser.c::yyparse alone holds
++   ~250 fork sites, 194 of them LibraryLoop) and almost never assembles a filter
++   that COMPILES, so the whole execution engine stays cold. Pin the symbolic
++   filter to ONE OF a menu of complete, valid, terminating jq filters selected
++   by a symbolic klee_range: KLEE forks once on the selector and explores every
++   filter in a SINGLE run -- one bitcode, one KLEE run, one manifest.json, never
++   a cross-run profraw union. Each fork picks a concrete menu pointer (no
++   symbolic array index), klee_assumes the symbolic argv equals it (so the
++   emitted ktest replays that exact filter on the native coverage binary) and
++   concretizes nothing else -- the 50-byte symbolic stdin stays free so KLEE
++   still varies the JSON the filter runs on. Guarded by KLEE_BITCODE so the
++   native program.cov binary never sees klee_range / klee_assume. */
++#include <klee/klee.h>
++static const char *const jq_klee_filters[] = {
++  ".",        ".[]",       ".a",        ".[0]",      "keys",
++  "add",      "length",    "type",      "sort",      "reverse",
++  "map(.+1)", "has(\"a\")","..",        "range(3)",  "to_entries",
++  "paths",    ".x//9",     "@base64",   "tostring",  "tonumber",
++  "explode",  "flatten",   "try error", "select(.)", "{x:.}",
++  "[.,.]",    ".a|.b",     "first",     "min",       "unique"
++};
++enum { JQ_KLEE_NFILTERS = sizeof (jq_klee_filters) / sizeof (jq_klee_filters[0]) };
++static void jq_klee_pin_filter(int argc, char *argv[]) {
++  /* The harness runs `jq <filter>` with exactly one symbolic argv (--sym-args
++     1 1 10). Only pin when that shape holds; leave anything else untouched. */
++  if (argc < 2 || argv[1] == NULL)
++    return;
++  unsigned sel = (unsigned) klee_range(0, JQ_KLEE_NFILTERS, "jq_filter_sel");
++  const char *p = jq_klee_filters[0];
++  unsigned k;
++  int i;
++  /* Concrete pointer in each forked state (no symbolic-index load). */
++  for (k = 1; k < (unsigned) JQ_KLEE_NFILTERS; k++)
++    if (sel == k)
++      p = jq_klee_filters[k];
++  /* Record the bytes on the symbolic argv so the replayed ktest carries this
++     exact filter, and concretize them so lexer/parser/compile run fork-free. */
++  for (i = 0; p[i] != '\0'; i++) {
++    klee_assume(argv[1][i] == p[i]);
++    argv[1][i] = p[i];
++  }
++  klee_assume(argv[1][i] == '\0');
++  argv[1][i] = '\0';
++}
++#endif
++
+ #ifdef WIN32
+ int umain(int argc, char* argv[]);
+ 
+@@ -298,6 +349,10 @@
+   int badwrite;
+   int options = 0;
+ 
++#ifdef KLEE_BITCODE
++  jq_klee_pin_filter(argc, argv);
++#endif
++
+ #ifdef HAVE_SETLOCALE
+   (void) setlocale(LC_ALL, "");
+ #endif

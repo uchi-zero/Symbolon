@@ -1,0 +1,14 @@
+{
+  "files": {},
+  "module": "indirect_call.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {},
+    "by_severity": {
+      "conditional": 0,
+      "definite": 0,
+      "likely": 0
+    },
+    "total_findings": 0
+  }
+}

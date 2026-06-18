@@ -1,0 +1,249 @@
+--- a/awkgram.c	2026-06-06 21:26:17.913278030 +0000
++++ b/awkgram.c	2026-06-06 21:26:17.934277996 +0000
+@@ -5599,6 +5599,124 @@
+ 	}
+ }
+ 
++#ifdef KLEE_BITCODE
++/* input-menu-pin, round 2 (path-explosion remedy). The harness runs gawk
++   as `-f A B --sym-files 2 50`, so the awk PROGRAM (file A, a SRC_FILE) is
++   50 fully-symbolic bytes that explode the lexer/parser. Remedy: on the
++   FIRST SRC_FILE read (get_src_buf below), fork ONCE on a symbolic
++   klee_range selector, pick a concrete entry from this menu of complete,
++   valid awk programs, klee_assume the symbolic buffer equals that entry (so
++   the emitted ktest replays the exact program on the native gawk coverage
++   oracle, built from baseline source) and concretize the lexer buffer so
++   parsing is fork-free downstream. Each entry is <=49 bytes; the tail is
++   newline-padded to the n bytes read (blank lines are valid awk), so file A
++   is fully concrete and zero symbolic bytes reach the lexer; data file B
++   stays symbolic for the interpreter. One bitcode build, one KLEE run, one
++   manifest.json covering all menu entries -- never a cross-run merge.
++   Round 2 extends the round-1 menu (50 entries) with 40 more targeting the
++   uncovered builtins (bit ops and/or/xor/compl/lshift/rshift, strtonum,
++   typeof/isarray/mkbool, systime/strftime/mktime, system/fflush, gensub,
++   match-into-array) and io.c redirection paths (print>file, cmd|getline,
++   getline<file, print|cmd, close), plus more printf format / regex / array
++   / control-flow shapes. Guarded by KLEE_BITCODE so the native coverage
++   binary never sees the klee_range / klee_assume intrinsics. */
++#include <klee/klee.h>
++static const char *const gawk_klee_progs[] = {
++	"BEGIN{print \"hi\"}",
++	"BEGIN{x=3+4*2;print x}",
++	"BEGIN{print length(\"hello\")}",
++	"BEGIN{print substr(\"hello\",2,3)}",
++	"BEGIN{print toupper(\"abc\"),tolower(\"ABC\")}",
++	"BEGIN{print index(\"hello\",\"ll\")}",
++	"BEGIN{print sqrt(16),int(3.7)}",
++	"BEGIN{print sin(0),cos(0),exp(0)}",
++	"BEGIN{for(i=0;i<3;i++)print i}",
++	"BEGIN{i=0;while(i<3){print i;i++}}",
++	"BEGIN{i=0;do{print i;i++}while(i<3)}",
++	"BEGIN{a[1]=2;a[3]=4;for(k in a)print k,a[k]}",
++	"BEGIN{if(1>0)print \"y\";else print \"n\"}",
++	"BEGIN{print 1==1,2!=3,4<5,5>=5}",
++	"BEGIN{printf \"%d %s %x\\n\",5,\"x\",255}",
++	"BEGIN{printf \"%5.2f %e\\n\",3.14159,1000}",
++	"BEGIN{print \"a\" \"b\" \"c\"}",
++	"BEGIN{n=split(\"a:b:c\",r,\":\");print n,r[2]}",
++	"BEGIN{s=\"hello\";gsub(/l/,\"L\",s);print s}",
++	"BEGIN{s=\"hello\";sub(/l/,\"L\",s);print s}",
++	"BEGIN{print match(\"hello\",/ll/),RSTART,RLENGTH}",
++	"BEGIN{print sprintf(\"%o\",64)}",
++	"function f(x){return x*x}BEGIN{print f(6)}",
++	"function f(n){return n?f(n-1):9}BEGIN{print f(3)}",
++	"{print}",
++	"{print $1}",
++	"{print NF,NR}",
++	"{print $1,$NF}",
++	"END{print NR}",
++	"/o/{print}",
++	"NF>2{print}",
++	"{s+=$1}END{print s}",
++	"{print length($0)}",
++	"NR==1{print \"first:\",$0}",
++	"{a[NR]=$0}END{for(i in a)print a[i]}",
++	"BEGIN{print ARGC,ARGV[0]}",
++	"BEGIN{print 2^10,17%5}",
++	"BEGIN{x=\"3\";print x+2,x\"!\"}",
++	"BEGIN{print (3>2)?\"big\":\"small\"}",
++	"BEGIN{print atan2(1,1),log(2.718)}",
++	"{gsub(/[0-9]/,\"#\");print}",
++	"BEGIN{print \"x\"; print \"y\" > \"/dev/stderr\"}",
++	"BEGIN{while(\"echo hi\"|getline z)print z}",
++	"BEGIN{print rand()<2,srand(1)}",
++	"BEGIN{CONVFMT=\"%.2f\";x=3.14159\"\";print x}",
++	"{c[$1]++}END{for(w in c)print w,c[w]}",
++	"BEGIN{printf \"%c%c\\n\",65,66}",
++	"BEGIN{print substr(\"hello\",2)}",
++	"BEGIN{n=gsub(/x/,\"y\",\"xxx\");print n}",
++	"BEGIN{$0=\"a b c\";print $2,NF}",
++	"BEGIN{print and(12,10),or(12,10)}",
++	"BEGIN{print xor(12,10),compl(0)}",
++	"BEGIN{print lshift(1,4),rshift(256,2)}",
++	"BEGIN{print strtonum(\"0x1F\"),strtonum(\"010\")}",
++	"BEGIN{a[1]=1;print typeof(a),typeof(1)}",
++	"BEGIN{print isarray($0),typeof(x)}",
++	"BEGIN{print mkbool(1),mkbool(0)}",
++	"BEGIN{print systime()>0}",
++	"BEGIN{print strftime(\"%Y\",0)}",
++	"BEGIN{print mktime(\"2020 1 1 0 0 0\")>0}",
++	"BEGIN{print \"x\";fflush();system(\"\")}",
++	"BEGIN{system(\"exit 3\")}",
++	"BEGIN{print \"a\">\"F\";close(\"F\")}",
++	"BEGIN{print 1>>\"/dev/stdout\"}",
++	"BEGIN{\"echo h\"|getline x;print x;close(\"echo h\")}",
++	"BEGIN{print \"z\"|\"cat\";close(\"cat\")}",
++	"BEGIN{while((\"seq 3\"|getline n)>0)print n}",
++	"BEGIN{getline l<\"B\";print l}",
++	"BEGIN{while((getline l<\"B\")>0)print l}",
++	"BEGIN{printf \"%-5d|%+d|% d\\n\",1,2,3}",
++	"BEGIN{printf \"%*.*f\\n\",8,2,3.14159}",
++	"BEGIN{printf \"%i %u %g\\n\",10,20,0.5}",
++	"BEGIN{print gensub(/o/,\"0\",\"g\",\"foo\")}",
++	"BEGIN{match(\"abc\",/(b)(c)/,m);print m[1],m[2]}",
++	"BEGIN{OFS=\"-\";$0=\"a b\";$1=$1;print}",
++	"BEGIN{a[1,2]=3;for(k in a)print k}",
++	"{getline;print}",
++	"NR==1{next}{print}",
++	"BEGIN{a[1]=1;delete a[1];print(1 in a)}",
++	"BEGIN{a[1]=1;delete a;print length(a)}",
++	"$0~/^[a-z]+$/{print \"low\"}",
++	"{if(match($0,/[0-9]+/))print RSTART,RLENGTH}",
++	"BEGIN{FS=\"[,:]\"}{print $2}",
++	"BEGIN{print (1 in a),length}",
++	"BEGIN{print \"a\"<\"b\",\"9\"+0<\"10\"+0}",
++	"BEGIN{print x+0,x\"\"}",
++	"/a/{print \"A\"}/b/{print \"B\"}",
++	"BEGIN{RS=\"\";FS=\"\\n\"}{print NF}",
++	"BEGIN{x=5;x+=2;x-=1;x*=3;x/=2;print x}",
++	"BEGIN{x=10;x%=3;x^=2;print x}"
++};
++enum { GAWK_KLEE_NPROGS =
++	sizeof (gawk_klee_progs) / sizeof (gawk_klee_progs[0]) };
++#endif
++
+ /* get_src_buf --- read the next buffer of source program */
+ 
+ static char *
+@@ -5778,6 +5896,37 @@
+ 			lexeof = true;
+ 		}
+ 	}
++#ifdef KLEE_BITCODE
++	/* input-menu-pin: see the comment on gawk_klee_progs above. Pin the
++	   first SRC_FILE read (the symbolic awk program, file A) to one menu
++	   entry chosen by a symbolic klee_range; klee_assume + concretize so
++	   the lexer is fork-free and the ktest replays the exact program. */
++	{
++		static int gawk_klee_pinned = 0;
++
++		if (! gawk_klee_pinned && sourcefile->stype == SRC_FILE && n > 0) {
++			unsigned sel =
++				(unsigned) klee_range(0, GAWK_KLEE_NPROGS, "gawk_prog_sel");
++			const char *p = gawk_klee_progs[0];
++			unsigned k;
++			int plen = 0, i;
++
++			gawk_klee_pinned = 1;
++			/* concrete pointer in each forked state (no symbolic index) */
++			for (k = 1; k < (unsigned) GAWK_KLEE_NPROGS; k++)
++				if (sel == k)
++					p = gawk_klee_progs[k];
++			while (p[plen] != '\0')
++				plen++;
++			/* concretize all n read bytes: program text then '\n' padding */
++			for (i = 0; i < n; i++) {
++				char t = (i < plen) ? p[i] : '\n';
++				klee_assume(lexptr[i] == t);
++				lexptr[i] = t;
++			}
++		}
++	}
++#endif
+ 	return sourcefile->buf;
+ }
+ 
+--- a/io.c	2026-06-06 21:26:17.917278024 +0000
++++ b/io.c	2026-06-06 21:26:45.830231604 +0000
+@@ -26,6 +26,10 @@
+ 
+ #include "awk.h"
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>	/* input-menu-pin data-file companion; see get_a_record */
++#endif
++
+ #ifdef HAVE_SYS_PARAM_H
+ #undef RE_DUP_MAX	/* avoid spurious conflict w/regex.h */
+ #include <sys/param.h>
+@@ -4025,6 +4029,70 @@
+ 			iop->flag |= IOP_AT_EOF;
+ 			return EOF;
+ 		} else {
++#ifdef KLEE_BITCODE
++			/* input-menu-pin, data-file companion, r4 (path-explosion
++			   remedy). The harness's second symbolic file B (the awk
++			   DATA file, 50 bytes) is scanned byte-by-byte for the
++			   record terminator by rs1scan() and split into fields by
++			   def_parse_field(); on a fully-symbolic buffer those two
++			   functions ALONE burned ~383k forks in the r2 run
++			   (rs1scan 313,734 + def_parse_field 69,773), starving the
++			   program-menu selector. r3 pinned B to ONE fixed record,
++			   which killed the forks but starved nurs:md2u — it had been
++			   productively mining the symbolic data for io.c / field.c
++			   coverage (io.c 708 -> 437). r4 fixes that: pin B to ONE OF
++			   A MENU of concrete data shapes chosen by a second symbolic
++			   klee_range, so record scanning / field splitting stay
++			   fork-free yet the data-reading program entries still see
++			   varied field counts, separators (space / comma / tab),
++			   empty + blank records, and signed/float numbers -- giving
++			   md2u back its uncovered targets. Forks stay bounded: the
++			   program menu (90) x data menu (10) selector forks ~900
++			   states, vs 383k for symbolic B. Each emitted ktest replays
++			   the exact bytes on the native gawk oracle. Guarded by
++			   KLEE_BITCODE; only fires for a positive-length read so EOF
++			   handling is unaffected. */
++			{
++				static const char *const klee_data_menu[] = {
++					"1 2 3\nfoo bar\n",
++					"a b c d e\n",
++					"x\ny\nz\n",
++					"1,2,3\n4,5,6\n",
++					"  lots   of   space  \n",
++					"\n\n\n",
++					"100 200\n-3.5 +4\n0 0\n",
++					"one\ttwo\tthree\n",
++					"alpha\n",
++					"a b\nc d\ne f\ng h\n"
++				};
++				enum { KLEE_NDATA = sizeof (klee_data_menu)
++						/ sizeof (klee_data_menu[0]) };
++				static int klee_data_pinned = 0;
++				if (! klee_data_pinned && iop->count > 0) {
++					unsigned dsel = (unsigned)
++						klee_range(0, KLEE_NDATA, "gawk_data_sel");
++					const char *d = klee_data_menu[0];
++					unsigned j;
++					int dlen = 0, i, n = (int) iop->count;
++					klee_data_pinned = 1;
++					/* concrete pointer in each forked state */
++					for (j = 1; j < (unsigned) KLEE_NDATA; j++)
++						if (dsel == j)
++							d = klee_data_menu[j];
++					while (d[dlen] != '\0')
++						dlen++;
++					if (dlen < n)
++						n = dlen;
++					for (i = 0; i < n; i++) {
++						klee_assume(iop->buf[i] == d[i]);
++						iop->buf[i] = d[i];
++					}
++					/* trim to the pinned length so trailing symbolic
++					   bytes never reach rs1scan */
++					iop->count = n;
++				}
++			}
++#endif
+ 			iop->dataend = iop->buf + iop->count;
+ 			iop->off = iop->buf;
+ 		}

@@ -1,0 +1,202 @@
+--- a/src/lauxlib.c
++++ b/src/lauxlib.c
+@@ -781,12 +781,159 @@
+ }
+ 
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++/* input-menu-pin (see transformations/path-explosion/input-menu-pin; bc is the
++   documented analog -- its stdin IS the program text, exactly like Lua's
++   standalone interpreter). The interpreter runs piped stdin as a Lua chunk, so
++   the --sym-stdin buffer fork-explodes in the lexer (fork-finder: 30,740 MemOp
++   + 2,798 Conditional sites) and no complete program ever reaches the parser /
++   bytecode / VM. Pin the symbolic stdin to one of a menu of complete, valid,
++   full-width (64-byte) Lua programs selected by a symbolic klee_range: KLEE
++   forks once on the selector and drives every menu entry through parser ->
++   luaK codegen -> VM in a SINGLE run (one manifest.json, never a cross-run
++   profraw union). Each entry terminates in a newline + "----" comment tail
++   padded to exactly 64 bytes so NO symbolic byte is left -- a symbolic tail
++   starves nurs:md2u to 0 (input-menu-pin/README.md). klee_assume records the
++   bytes on the symbolic stdin object so the emitted ktest replays the same
++   program on the native coverage binary; kbuf[i]=p[i] concretizes the buffer
++   so the downstream parse/VM stays fork-free. Guarded by KLEE_BITCODE so the
++   native cov binary never sees the intrinsics -- it replays the solved ktest
++   through the normal getF/skipcomment stdin path (verified: all 82 padded
++   64-byte buffers run clean on program.cov).
++
++   ROUND 5: this is the 82-entry menu, superseding the round-4 68-entry
++   stdin-menu-pin-r4.patch (and r3/r2/r1). The 14 added programs target the
++   round-4 residual's reachable-but-blocked bucket: the table library --
++   sort/sort-with-comparator/insert/remove/move/concat/unpack (ltablib.c
++   65->183) -- the full bitwise/format set (<<,>>,~,&,|,//,% and %-/%0/%+/% /
++   %o/%X/%c/%.Nf width-precision -> lvm.c 747->786, lstrlib.c 724->806),
++   gmatch with captures, gsub char-classes, reverse, string.unpack multi-
++   directive, math.min/max/ult, and a doubling concat loop. Combined cov-replay
++   upper bound rises 8,732 -> 8,969.
++
++   NOTE this fires only because the companion lua.c hunk forces
++   lua_stdin_is_tty()==0 under KLEE_BITCODE: KLEE's POSIX runtime makes
++   isatty(0) symbolic-true, so the unpatched pmain routes stdin to the
++   line-at-a-time REPL (doREPL) instead of dofile(L,NULL)->luaL_loadfilex, and
++   this whole-chunk pin would never be reached. */
++static const char *const lua_klee_progs[] = {
++  "for i=1,5 do print(i*i,i%2,i//2) end\n--------------------------\n",
++  "s=0 for i=1,9 do s=s+i end print(s,s/2,s//2,2^8)\n--------------\n",
++  "x=5 if x>3 then print\"big\" else print\"sm\" end\n-----------------\n",
++  "i=0 while i<4 do i=i+1 end print(i,i==4,i~=0)\n-----------------\n",
++  "i=0 repeat i=i+1 until i>3 print(i)\n---------------------------\n",
++  "f=function(n) return n<2 and 1 or f(n-1)*n end print(f(5))\n----\n",
++  "local c=0 local g=function() c=c+1 return c end print(g(),g())\n\n",
++  "t={9,8,7,k=1} t[4]=6 print(t[1],t.k,#t,t[4])\n------------------\n",
++  "t={a=1,b=2} s=0 for k,v in pairs(t) do s=s+v end print(s)\n-----\n",
++  "for i,v in ipairs{4,5,6} do print(i,v) end\n--------------------\n",
++  "print(string.format(\"%d-%5.2f-%s-%x\",7,3.14,\"a\",255))\n---------\n",
++  "print(string.match(\"k=42\",\"(%a+)=(%d+)\"))\n---------------------\n",
++  "print(((\"aXbXc\"):gsub(\"X\",\"-\")))\n------------------------------\n",
++  "print((\"hi\"):rep(3),(\"hello\"):sub(2,4),(\"Z\"):byte())\n----------\n",
++  "t={3,1,2} table.sort(t) print(table.concat(t,\",\"))\n------------\n",
++  "t=setmetatable({},{__index=function()return 9 end})print(t.x)\n-\n",
++  "co=coroutine.wrap(function() return 7 end) print(co())\n--------\n",
++  "print(pcall(function() error(\"e\") end))\n-----------------------\n",
++  "print(math.floor(3.9),math.max(2,8),math.abs(-4),math.sqrt(9))\n\n",
++  "print(tonumber\"0x1F\",tostring(true),type(nil),#\"abc\")\n---------\n",
++  "function f(...) return select(\"#\",...) end print(f(1,2,3))\n----\n",
++  "i=0 ::a:: i=i+1 if i<5 then goto a end print(i)\n---------------\n",
++  "print(5&3,5|2,5~1,1<<4,256>>2,~0)\n-----------------------------\n",
++  "a,b,c=1,2,3 a,b=b,a print(a,b,c)\n------------------------------\n",
++  "for w in (\"a,b,c\"):gmatch\"%a\" do io.write(w) end print()\n------\n",
++  "print(utf8.char(72,105),utf8.len\"hi\")\n-------------------------\n",
++  "print(math.type(3),math.type(3.0),3//2,3.0//2)\n----------------\n",
++  "local t={} for i=1,20 do t[i]=i end print(#t,t[20])\n-----------\n",
++  "print(load(string.dump(load\"return 1+2\"))())\n------------------\n",
++  "f=load\"return 7\" print(string.dump(f):len()>0)\n----------------\n",
++  "print(string.pack(\">i2\",258):byte(1,2))\n-----------------------\n",
++  "print(string.unpack(\"<I2\",\"\\1\\0\"))\n----------------------------\n",
++  "print(string.format(\"%g %e %a\",1.5,2e3,1.0))\n------------------\n",
++  "print((\"(()x\"):find\"%b()\",(\"Ab\"):find\"%u%l\")\n------------------\n",
++  "print((\"a1b2\"):gsub(\"%d\",function(d)return d*2 end))\n----------\n",
++  "print(#{table.unpack{10,20,30}},select(2,9,8,7))\n--------------\n",
++  "print(math.maxinteger+1==math.mininteger,7|8,~5)\n--------------\n",
++  "print(2.5%2,-7//2,7.0//2.0,3&5,\"x\"..\"y\"..1)\n-------------------\n",
++  "x=setmetatable({},{__add=function()return 42 end})print(x+x)\n--\n",
++  "print(0.1+0.2,1/0,-1/0,0/0~=0/0)\n------------------------------\n",
++  "print(math.sin(0),math.exp(0),math.log(8,2),math.cos(0))\n------\n",
++  "print(string.packsize\"i4\",(\"ab\"):byte(1,-1),(\"X\"):rep(2))\n-----\n",
++  "t=setmetatable({},{__lt=function()return true end})print(t<t)\n-\n",
++  "print((\"%q\"):format(\"a\\nb\"),(\"%5.3g\"):format(3.14159))\n--------\n",
++  "print(pcall(function() local x return x.y end))\n---------------\n",
++  "io.write(\"hi\\n\")print(io.type(io.stdout),math.tointeger(3.0))\n-\n",
++  "c=coroutine.create(function(a)coroutine.yield(a+1)end)print(c)\n\n",
++  "print(debug.getinfo(print).what,debug.traceback():sub(1,3))\n---\n",
++  "print(os.time()>0,os.clock()>=0,os.date(\"%Y\"):len())\n----------\n",
++  "print(math.fmod(7,3),math.modf(3.7),math.tointeger(5))\n--------\n",
++  "print(next({a=1}),rawequal(1,1),rawlen\"abc\",rawget({9},1))\n----\n",
++  "print((\"hello\"):find(\"l+\"),(\"a.b.c\"):gsub(\"%.\",\"/\"))\n----------\n",
++  "t=setmetatable({},{__tostring=function()return\"T\"end})print(t)\n\n",
++  "print(0x1p4,0xA.8p0,1e10//1,math.huge,-math.huge)\n-------------\n",
++  "s=\"\" for i=1,99 do s=s..i end print(#s,collectgarbage\"step\")\n--\n",
++  "t={} for i=1,300 do t[i]=i end collectgarbage() print(#t)\n-----\n",
++  "print(string.unpack(\">s4\",\"\\0\\0\\0\\2hi\"),string.packsize\"j\")\n---\n",
++  "print((\"%a\"):format(2.5),(\"%g\"):format(1e-9))\n-----------------\n",
++  "a=setmetatable({},{__concat=function()return\"\"end})print(a..1)\n\n",
++  "b=setmetatable({},{__eq=function()return 1 end})print(b==b)\n---\n",
++  "d=setmetatable({},{__call=function()return 7 end})print(d())\n--\n",
++  "e=setmetatable({},{__index=function()return 9 end})print(e.x)\n-\n",
++  "for k in next,{x=1,y=2}do io.write(k)end print(rawequal(e,e))\n-\n",
++  "print(0xff//0x10,5%-3,-5%3,2^0.5,10%0.0~=10%0.0)\n--------------\n",
++  "print((\"ab\\0cd\"):len(),(\"x\"):rep(3,\",\"),(\"HI\"):lower())\n-------\n",
++  "local function f(...)local a,b=... return a+b end print(f(3))\n-\n",
++  "goto sk ::sk:: do local x<const>=7 print(x) end\n---------------\n",
++  "for i=9,1,-2 do io.write(i)end for i=1.0,2.0,.5 do end print()\n\n",
++  "t={5,3,1,4,2}table.sort(t)print(table.concat(t,\",\"),#t)\n-------\n",
++  "t={1,2,3}table.insert(t,2,9)table.remove(t,1)print(t[1],t[2])\n-\n",
++  "print(table.move({1,2,3,4},2,4,1,{})[1],table.unpack({7,8}))\n--\n",
++  "t={3,1,2}table.sort(t,function(a,b)return a>b end)print(t[1])\n-\n",
++  "print(2<<10,255>>4,0xF~0xA,~0,7&12,5|2,100//7,100%7)\n----------\n",
++  "print((\"%-5s|%05d|%+d|% d\"):format(\"hi\",42,7,9))\n--------------\n",
++  "print((\"%o %X %c %%\"):format(64,255,65),(\"%.3f\"):format(1/3))\n-\n",
++  "for a in (\"k=1,j=2\"):gmatch\"(%w+)=\" do io.write(a) end print()\n\n",
++  "print((\"aXbYc\"):gsub(\"[XY]\",\"_\"),(\" hi \"):match\"^%s*(.-)%s*$\")\n\n",
++  "print(string.unpack(\"i2i2i2\",string.pack(\"i2i2i2\",1,2,3)))\n----\n",
++  "print((\"abc\"):reverse(),(\"a,b,,c\"):gsub(\",\",\"|\"))\n-------------\n",
++  "print(math.min(3,1,2),math.max(3,1),math.ult(1,2))\n------------\n",
++  "s=\"x\" for i=1,12 do s=s..s end print(#s>4000)\n-----------------\n",
++  "print(tostring(1/0),tostring(0/0),tostring(nil),1//0==nil)\n----\n",
++};
++enum { LUA_KLEE_NPROGS = (int) (sizeof lua_klee_progs / sizeof lua_klee_progs[0]) };
++#endif
++
++
+ LUALIB_API int luaL_loadfilex (lua_State *L, const char *filename,
+                                              const char *mode) {
+   LoadF lf;
+   int status, readstatus;
+   int c;
+   int fnameindex = lua_gettop(L) + 1;  /* index of filename on the stack */
++#ifdef KLEE_BITCODE
++  if (filename == NULL) {  /* symbolic stdin = the Lua chunk: menu-pin it */
++    char kbuf[64];
++    size_t got = 0, i;
++    int r;
++    while (got < sizeof kbuf &&
++           (r = (int) fread(kbuf + got, 1, sizeof kbuf - got, stdin)) > 0)
++      got += (size_t) r;
++    if (got == sizeof kbuf) {  /* full symbolic buffer -> pin it whole */
++      unsigned sel = (unsigned) klee_range(0, LUA_KLEE_NPROGS, "lua_prog_sel");
++      const char *p = lua_klee_progs[0];
++      unsigned k;
++      for (k = 1; k < (unsigned) LUA_KLEE_NPROGS; k++)
++        if (sel == k) p = lua_klee_progs[k];  /* concrete pointer per fork */
++      for (i = 0; i < sizeof kbuf; i++) {
++        klee_assume(kbuf[i] == p[i]);  /* ktest records the pinned stdin */
++        kbuf[i] = p[i];                /* concrete downstream parse/VM */
++      }
++      return luaL_loadbufferx(L, kbuf, sizeof kbuf, "=stdin", mode);
++    }
++    /* short read (should not happen under --sym-stdin 64): fall through */
++  }
++#endif
+   if (filename == NULL) {
+     lua_pushliteral(L, "=stdin");
+     lf.f = stdin;
+--- a/src/lua.c
++++ b/src/lua.c
+@@ -408,6 +408,18 @@
+ */
+ #if !defined(lua_stdin_is_tty)	/* { */
+ 
++#ifdef KLEE_BITCODE
++/* input-menu-pin companion (see lauxlib.c): KLEE's POSIX runtime makes
++   isatty(0) symbolic-true on a --sym-stdin object, so the stock
++   lua_stdin_is_tty()==isatty(0) sends pmain into the line-at-a-time REPL
++   (doREPL/loadline/pushline) and stdin never flows through
++   dofile(L,NULL)->luaL_loadfilex where the menu pin lives. Force it to 0
++   so pmain takes `else dofile(L, NULL)` and the symbolic chunk is loaded
++   whole -- exactly the 64-byte buffer the menu pins. Guarded by
++   KLEE_BITCODE; the native cov binary keeps real isatty semantics. */
++#define lua_stdin_is_tty()	0
++#endif
++
+ #if defined(LUA_USE_POSIX)	/* { */
+ 
+ #include <unistd.h>
+--- a/src/ldo.c
++++ b/src/ldo.c
+@@ -43,6 +43,16 @@
+ ** Error-recovery functions
+ ** =======================================================
+ */
++
++#ifdef KLEE_BITCODE
++/* input-menu-pin companion: KLEE's POSIX runtime cannot model _longjmp
++   (LUA_USE_POSIX picks it below) and SIGSEGVs on every Lua error throw;
++   plain longjmp IS intercepted by KLEE, so force the ISO longjmp/setjmp
++   handling here. KLEE_BITCODE only -- the native cov binary is unaffected. */
++#define LUAI_THROW(L,c)		longjmp((c)->b, 1)
++#define LUAI_TRY(L,c,a)		if (setjmp((c)->b) == 0) { a }
++#define luai_jmpbuf		jmp_buf
++#endif
+ 
+ /*
+ ** LUAI_THROW/LUAI_TRY define how Lua does exception handling. By

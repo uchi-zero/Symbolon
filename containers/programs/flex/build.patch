@@ -1,0 +1,39 @@
+--- a/src/misc.c
++++ b/src/misc.c
+@@ -142,7 +142,7 @@
+ void   *allocate_array (int size, size_t element_size)
+ {
+ 	void *mem;
+-#if HAVE_REALLOCARRAY
++#if 0  /* HAVE_REALLOCARRAY: KLEE-uclibc does not model reallocarray */
+ 	/* reallocarray has built-in overflow detection */
+ 	mem = reallocarray(NULL, (size_t) size, element_size);
+ #else
+@@ -659,7 +659,7 @@
+ void   *reallocate_array (void *array, int size, size_t element_size)
+ {
+ 	void *new_array;
+-#if HAVE_REALLOCARRAY
++#if 0  /* HAVE_REALLOCARRAY: KLEE-uclibc does not model reallocarray */
+ 	/* reallocarray has built-in overflow detection */
+ 	new_array = reallocarray(array, (size_t) size, element_size);
+ #else
+--- a/src/flexdef.h
++++ b/src/flexdef.h
+@@ -1070,7 +1070,16 @@
+ /* For setjmp/longjmp (instead of calling exit(2)). Linkage in main.c */
+ extern jmp_buf flex_main_jmp_buf;
+
++/* In the KLEE bitcode build the longjmp model is unsupported, so we exit
++ * directly to keep symbolic states alive. In the instrumented concrete
++ * build (which klee-replay invokes for coverage) we keep the longjmp so
++ * exit happens cleanly from main(), avoiding atexit-handler corruption of
++ * LLVM's profile counters when FLEX_EXIT fires deep in the parser stack. */
++#ifdef SYMBOLON_KLEE_BITCODE
++#define FLEX_EXIT(status) exit(status)
++#else
+ #define FLEX_EXIT(status) longjmp(flex_main_jmp_buf,(status)+1)
++#endif
+
+ /* Removes all \n and \r chars from tail of str. returns str. */
+ extern char *chomp (char *str);

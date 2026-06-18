@@ -1,0 +1,52 @@
+{
+  "files": {
+    "loop_indirect_call.c": {
+      "functions": {
+        "apply_all": {
+          "lines": {
+            "5": {
+              "categories": [
+                "Conditional",
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "br",
+                "load",
+                "store"
+              ]
+            },
+            "6": {
+              "categories": [
+                "Call",
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "call",
+                "load",
+                "store"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "loop_indirect_call.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 1,
+      "Conditional": 1,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 2,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 2
+  }
+}

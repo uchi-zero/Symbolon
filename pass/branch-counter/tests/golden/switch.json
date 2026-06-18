@@ -1,0 +1,22 @@
+{
+  "files": {
+    "switch.c": {
+      "branch_count": 1,
+      "branches": [
+        {
+          "line": 3,
+          "opcode": "switch",
+          "outcomes": 4
+        }
+      ],
+      "outcome_count": 4
+    }
+  },
+  "module": "switch.bc",
+  "schema_version": 1,
+  "summary": {
+    "total_branches": 1,
+    "total_files": 1,
+    "total_outcomes": 4
+  }
+}

@@ -1,0 +1,62 @@
+--- a/binutils/objcopy.c	2026-05-31 02:21:43.786467445 +0000
++++ b/binutils/objcopy.c	2026-06-01 04:26:01.492258031 +0000
+@@ -32,6 +32,12 @@
+ #include "safe-ctype.h"
+ #include "plugin.h"
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
+ /* FIXME: See bfd/peXXigen.c for why we include an architecture specific
+    header in generic PE code.  */
+ #include "coff/i386.h"
+@@ -6281,6 +6287,46 @@
+   program_name = argv[0];
+   xmalloc_set_program_name (program_name);
+ 
++#ifdef KLEE_BITCODE
++  /* strip-new-elf-header-pin (steering).  Runtime istats on the baseline show
++     the fork explosion is NOT in BFD format detection but in expandargv()'s
++     @file response-file handling: a symbolic argv element of the form "@A"
++     makes expandargv open the 100-byte symbolic file "A" and tokenise its
++     bytes char-by-char via libiberty buildargv() (448k self-forks, the whole
++     budget).  We therefore intervene *before* expandargv: pin argc to 2 so
++     argv is exactly { program_name, "A" } (the symEnv always appends a
++     concrete "A"; argc==2 is the cohort with zero leading symbolic args), and
++     pin the first 92 bytes of file "A" to a minimal valid ELF32 (ET_REL /
++     EM_386 + one NULL section, shstrndx=0 — the largest valid ELF that fits in
++     --sym-files 1 100).  With the argv explosion gone, the single surviving
++     state walks getopt -> copy_file -> bfd_check_format_matches (now resolving
++     to elf32-i386 on the pinned bytes) -> copy_object.  Bitcode-only: the cov
++     binary has no KLEE_BITCODE define, so ktest replay runs strip unchanged.  */
++  {
++    static const unsigned char klee_pin_elf[92] = {
++      0x7f, 0x45, 0x4c, 0x46, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++      0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
++      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00,
++      0x00, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x00,
++      0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    };
++    klee_assume (argc == 2);
++    int kfd = open ("A", O_RDONLY);
++    if (kfd >= 0)
++      {
++	unsigned char kbuf[92];
++	ssize_t kn = read (kfd, kbuf, sizeof (kbuf));
++	close (kfd);
++	if (kn == (ssize_t) sizeof (kbuf))
++	  for (int ki = 0; ki < (int) sizeof (kbuf); ki++)
++	    klee_assume (kbuf[ki] == klee_pin_elf[ki]);
++      }
++  }
++#endif
++
+   expandargv (&argc, &argv);
+ 
+   strip_symbols = STRIP_UNDEF;

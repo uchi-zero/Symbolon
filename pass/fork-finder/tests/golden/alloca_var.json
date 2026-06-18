@@ -1,0 +1,102 @@
+{
+  "files": {
+    "alloca_var.c": {
+      "functions": {
+        "sum_n": {
+          "lines": {
+            "10": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "load"
+              ]
+            },
+            "3": {
+              "categories": [
+                "Alloc",
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "alloca",
+                "load",
+                "store"
+              ]
+            },
+            "4": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            },
+            "5": {
+              "categories": [
+                "Conditional",
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "br",
+                "load",
+                "store"
+              ]
+            },
+            "6": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "load",
+                "store"
+              ]
+            },
+            "7": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "load",
+                "store"
+              ]
+            },
+            "9": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "load"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "alloca_var.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 1,
+      "Call": 0,
+      "Conditional": 1,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 7,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 7,
+    "unlocated_by_category": {
+      "MemOp": 1
+    }
+  }
+}

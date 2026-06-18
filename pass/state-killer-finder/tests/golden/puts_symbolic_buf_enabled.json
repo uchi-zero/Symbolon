@@ -1,0 +1,39 @@
+{
+  "files": {
+    "puts_symbolic_buf_enabled.c": {
+      "functions": {
+        "main": {
+          "lines": {
+            "6": {
+              "callees": [
+                "puts"
+              ],
+              "categories": [
+                "ExternCallSymPtr"
+              ],
+              "opcodes": [
+                "call"
+              ],
+              "severities": [
+                "likely"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "puts_symbolic_buf_enabled.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "ExternCallSymPtr": 1
+    },
+    "by_severity": {
+      "conditional": 0,
+      "definite": 0,
+      "likely": 1
+    },
+    "total_findings": 1
+  }
+}

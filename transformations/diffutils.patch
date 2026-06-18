@@ -1,0 +1,275 @@
+--- a/src/diff.c
++++ b/src/diff.c
+@@ -35,6 +35,11 @@
+ #include <filenamecat.h>
+ #include <fnmatch.h>
+ #include <getopt.h>
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#include <fcntl.h>
++#include <unistd.h>
++#endif
+ #include <hard-locale.h>
+ #include <progname.h>
+ #include <quote.h>
+@@ -313,6 +318,163 @@
+   presume_output_tty = false;
+   xstdopen ();
+ 
++#ifdef KLEE_BITCODE
++  /* diffutils formatter-menu-pin (r3): the single-run union of every output
++     style's coverage.  Three composed mechanisms, each killing one obstacle
++     the earlier rounds exposed:
++
++     (1) Tiny content pin.  Pin both 50-byte operand files A/B to a 2-line,
++	 1-changed-line diff ("a\nb\n..." vs "a\nX\n...", newline-padded).  r1
++	 pinned richer content; r2 showed that letting the FULL Myers diff
++	 complete over a real buffer forks into ~85 k non-terminating states.
++	 A 1-change diff makes the Myers matrix trivial, so every style's
++	 completing comparison is cheap and TERMINATES (emits a covering-new
++	 ktest).
++
++     (2) Argv formatter-menu via klee_range.  The symEnv's 0-2 symbolic argv
++	 bytes drive getopt_long; left symbolic they fork getopt across the
++	 whole option table (the other half of r2's explosion) and only ever
++	 emitted shallow argv-exit ktests, never a clean -c/-u/-e/-n/-y/-q
++	 termination -> those formatters replayed at 0 %.  Instead pick ONE
++	 concrete style flag per forked state with klee_range and rewrite argv
++	 to { prog, flag, "A", "B" }.  KLEE forks once on the selector; each
++	 fork runs getopt fork-free, drives diff_2_files to its matching
++	 print_*_script, and emits a ktest whose recorded argv replays that
++	 exact style on the cov binary.  Coverage = union of all styles in ONE
++	 run (input-menu-pin, the sanctioned single-run equivalent of merging
++	 per-style runs).
++
++     Bitcode-only (#ifdef KLEE_BITCODE); the cov replay binary sees real argv
++     and real files.  */
++  {
++    /* A multi-hunk diff (change/delete/add) that is ALSO character-rich
++       (r8): tabs, digits, punctuation, mixed case, a trailing-space line.
++       Newline-padded to 50 bytes.  This drives more of the per-character
++       classification on the content path -- c-ctype.h c_is* and mcel.h
++       mcel_scan in io.c:lines_differ / side.c -- and side.c's tab-column
++       handling, while staying a tiny prefix/suffix-trimmable diff so the Myers
++       core remains cheap (unlike the shelved r5 transposition).
++	 A: "Ab1" / "x,2\tQ" / "del " / "z9"
++	 B: "Ab1" / "X,2\tQ" /         "z9" / "New!"   (change, delete, add)  */
++    static const unsigned char klee_pin_a[50] = {
++      65,98,49,10,120,44,50,9,81,10,100,101,108,32,10,122,57,10,10,10,10,10,10,
++      10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,
++      10,10,10,
++    };
++    static const unsigned char klee_pin_b[50] = {
++      65,98,49,10,88,44,50,9,81,10,122,57,10,78,101,119,33,10,10,10,10,10,10,10,
++      10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,
++      10,10,
++    };
++    const char *klee_names[2] = { "A", "B" };
++    const unsigned char *klee_pins[2] = { klee_pin_a, klee_pin_b };
++    for (int kf = 0; kf < 2; kf++)
++      {
++	int kfd = open (klee_names[kf], O_RDONLY);
++	if (kfd >= 0)
++	  {
++	    unsigned char kbuf[50];
++	    ssize_t kn = read (kfd, kbuf, sizeof (kbuf));
++	    close (kfd);
++	    if (kn == (ssize_t) sizeof (kbuf))
++	      for (int ki = 0; ki < (int) sizeof (kbuf); ki++)
++		klee_assume (kbuf[ki] == klee_pins[kf][ki]);
++	  }
++      }
++
++    /* Output-style menu, applied to the REAL symbolic argv so the emitted
++       ktest replays the flag on the cov binary.  The symEnv is
++       `--sym-args 0 2 2 A B`: klee_init_env builds argv as
++       { prog, <0-2 symbolic args of <=2 chars>, "A", "B" } and records those
++       symbolic arg strings in the ktest.  We must therefore CONSTRAIN those
++       recorded bytes, not swap the argv pointer (an earlier version rebuilt a
++       local argv; replay then ran the original n_args=0 argv -> always normal
++       style, so only normal.c got covered).
++
++       Three cohorts, chosen by a klee_range so KLEE explores all styles in one
++       run and each emits a ktest (r4 widens r3's single 2-char cohort):
++	 sel 0            -> 0 symbolic args (argc==3): default NORMAL style.
++	 sel 1..NFLAGS    -> one 2-char flag arg (argc==4): pin argv[1] to a
++			     no-argument flag.  Output styles -c/-u/-e/-n/-y/-q
++			     PLUS the style/compare modifiers -f (forward-ed,
++			     ed.c:pr_forward_ed_*), -p (show-c-function ->
++			     context.c:find_function/print_context_function),
++			     and -w (ignore-all-space, a different compare).
++	 sel NFLAGS+1..   -> a TWO-arg invocation (argc==5): argv[1] a flag that
++			     TAKES an argument, argv[2] its value.  -D x recovers
++			     all of ifdef.c (print_ifdef_script/format_ifdef/...,
++			     ~277 lines that -D gates and r3 forfeited because -D
++			     needs an argument).
++       getopt_long then dispatches on the real argv; the ktest carries it, so
++       klee-replay feeds `diff -c A B` / `diff -D x A B` (etc.) to the native
++       binary and the matching print_*_script is exercised at replay.  */
++    static const char *const klee_flags[] = {
++      /* output styles */
++      "-c", "-u", "-e", "-n", "-y", "-q", "-f", "-p",
++      /* compare modifiers (r6): each takes a distinct branch in
++	 io.c:lines_differ's `switch (ignore_white_space)` / ignore_case /
++	 ignore_blank_lines, or in analyze.c, over the same cheap content, so
++	 they add comparison-core coverage without forcing the expensive Myers
++	 diag (cf. shelved r5).  All no-argument short flags:
++	 -w ignore-all-space, -b ignore-space-change, -Z ignore-trailing-cr,
++	 -E ignore-tab-expansion, -B ignore-blank-lines, -i ignore-case,
++	 -a text, -d minimal, -s report-identical, -l paginate, -t expand-tabs,
++	 -T initial-tab, -r recursive, -N new-file.  */
++      "-w", "-b", "-Z", "-E", "-B", "-i", "-a", "-d", "-s", "-l", "-t", "-T",
++      "-r", "-N",
++      /* r7: -v (version_etc -> version-etc.c, a clean printf path the menu had
++	 dropped vs the baseline), -H (speed_large_files -> the heuristic arm of
++	 the Myers diag in diffseq.h, reached cheaply by flipping the flag), -P
++	 (unidirectional-new-file), and -3 (a digit context shortcut, exercises
++	 the '0'..'9' switch arm + numeric context).  */
++      "-v", "-H", "-P", "-3",
++    };
++    /* Flags that take a one-char argument value: { flag, value }.
++       -D x  ifdef formatter (ifdef.c).
++       -C 5  context style with explicit numeric context (context.c width arm).
++       -U 5  unified style with explicit numeric context.
++       -I x  ignore-matching-lines regex (adds add_regexp / regex compile).
++       -x x  exclude pattern (exclude.c add_exclude).  */
++    static const char *const klee_argflags[][2] = {
++      { "-D", "x" }, { "-C", "5" }, { "-U", "5" }, { "-I", "x" }, { "-x", "x" },
++    };
++    enum { KLEE_NFLAGS = sizeof klee_flags / sizeof klee_flags[0] };
++    enum { KLEE_NARGF = sizeof klee_argflags / sizeof klee_argflags[0] };
++    unsigned klee_sel =
++      (unsigned) klee_range (0, KLEE_NFLAGS + KLEE_NARGF + 1, "fmt_sel");
++    if (klee_sel == 0)
++      {
++	/* normal style: no leading symbolic arg.  argv = { prog, A, B }.  */
++	klee_assume (argc == 3);
++      }
++    else if (klee_sel <= KLEE_NFLAGS)
++      {
++	/* one symbolic 2-char flag arg.  argv = { prog, flag, A, B }.  */
++	const char *kf = klee_flags[0];
++	for (unsigned k = 1; k < KLEE_NFLAGS; k++)
++	  if (klee_sel == k + 1)
++	    kf = klee_flags[k];
++	klee_assume (argc == 4);
++	klee_assume (argv[1][0] == kf[0]);
++	klee_assume (argv[1][1] == kf[1]);
++	klee_assume (argv[1][2] == '\0');
++      }
++    else
++      {
++	/* flag + value: argv = { prog, flag, value, A, B }.  */
++	unsigned ai = klee_sel - KLEE_NFLAGS - 1;
++	const char *kf = klee_argflags[ai][0];
++	const char *kv = klee_argflags[ai][1];
++	klee_assume (argc == 5);
++	klee_assume (argv[1][0] == kf[0]);
++	klee_assume (argv[1][1] == kf[1]);
++	klee_assume (argv[1][2] == '\0');
++	klee_assume (argv[2][0] == kv[0]);
++	klee_assume (argv[2][1] == '\0');
++      }
++  }
++#endif
++
+   /* Parse command line options.  */
+ 
+   lin ocontext = -1;
+@@ -1544,6 +1706,39 @@
+ 
+ 	      cmp.file[f].stat.st_size = size;
+ 	      cmp.file[f].filetype = c_file_type (&cmp.file[f].stat);
++
++#ifdef KLEE_BITCODE
++	      /* stat-pin (part of formatter-menu-pin).  The --sym-files stat
++		 object leaves st_blksize/st_size AND the timestamps symbolic.
++		 Two distinct explosions follow:
++		   - io.c:sip sizes the read buffer from ST_BLKSIZE(stat) and
++		     ximalloc()s a symbolic size -> "concretized symbolic size".
++		   - the context/unified header prints the file mtime:
++		     print_context_label -> get_stat_mtime -> localtime ->
++		     uClibc _time_t2tm over a SYMBOLIC time_t, which forks/solver-
++		     times-out massively (the smoke test died exactly here).  This
++		     is why context.c/side.c stayed at 0 even with content pinned.
++		 Pin the size fields AND all three timespecs to concrete values so
++		 sip allocates a concrete buffer and localtime/nstrftime run over
++		 a fixed time_t.  Then each per-style state runs to a clean Exit
++		 and emits its ktest.  Unlike the shelved r2, argv is also pinned
++		 to ONE concrete style per fork, so the surviving completing diff
++		 does NOT re-explode: cost is bounded by the 7-way klee_range.  */
++	      cmp.file[f].stat.st_blksize = 4096;
++	      cmp.file[f].stat.st_size = 50;
++	      cmp.file[f].stat.st_mode =
++		(cmp.file[f].stat.st_mode & ~(mode_t) S_IFMT) | S_IFREG;
++	      cmp.file[f].stat.st_mtim.tv_sec = 1000000000;
++	      cmp.file[f].stat.st_mtim.tv_nsec = 0;
++	      cmp.file[f].stat.st_atim.tv_sec = 1000000000;
++	      cmp.file[f].stat.st_atim.tv_nsec = 0;
++	      cmp.file[f].stat.st_ctim.tv_sec = 1000000000;
++	      cmp.file[f].stat.st_ctim.tv_nsec = 0;
++	      klee_assume (cmp.file[f].stat.st_blksize == 4096);
++	      klee_assume (cmp.file[f].stat.st_size == 50);
++	      klee_assume (cmp.file[f].stat.st_mtim.tv_sec == 1000000000);
++	      klee_assume (cmp.file[f].stat.st_mtim.tv_nsec == 0);
++#endif
+ 	    }
+ 	}
+ 
+--- a/src/io.c
++++ b/src/io.c
+@@ -25,6 +25,9 @@
+ #include <ialloc.h>
+ #include <mcel.h>
+ #include <xalloc.h>
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#endif
+ 
+ #include <ctype.h>
+ #include <uchar.h>
+@@ -1117,6 +1120,44 @@
+       filevec[1].missing_newline = filevec[0].missing_newline;
+     }
+ 
++#ifdef KLEE_BITCODE
++  /* formatter-menu-pin, buffer concretization step.  diff.c klee_assume'd the
++     two 50-byte symbolic files equal a concrete pin so the emitted ktest
++     replays that exact content on the cov binary.  But klee_assume only
++     *constrains* the bytes -- the prefix/suffix scan below and
++     find_and_hash_each_line still fork once per still-symbolic byte (the
++     smoke test showed 1 completed vs ~300 partial paths).  Overwrite the
++     slurped buffers with the same pin so all downstream byte reads are
++     concrete and fork-free, exactly as
++     transformations/path-explosion/input-menu-pin prescribes (assume for the
++     ktest, then write concrete bytes for fork-free downstream).  This must run
++     AFTER slurp()/prepare_text() (which re-read the file and may realloc the
++     buffer) and BEFORE the identical-prefix scan.  buffer[0..buffered) maps
++     1:1 to file bytes (strip_trailing_cr off; prepare_text only appends a
++     trailing newline).  */
++  {
++    static const unsigned char klee_pin_a[50] = {
++      65,98,49,10,120,44,50,9,81,10,100,101,108,32,10,122,57,10,10,10,10,10,10,
++      10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,
++      10,10,10,
++    };
++    static const unsigned char klee_pin_b[50] = {
++      65,98,49,10,88,44,50,9,81,10,122,57,10,78,101,119,33,10,10,10,10,10,10,10,
++      10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,
++      10,10,
++    };
++    const unsigned char *klee_pins[2] = { klee_pin_a, klee_pin_b };
++    for (int f = 0; f < 2; f++)
++      {
++	char *p = file_buffer (&filevec[f]);
++	idx_t nb = filevec[f].buffered;
++	if (p)
++	  for (idx_t j = 0; j < nb && j < 50; j++)
++	    p[j] = (char) klee_pins[f][j];
++      }
++  }
++#endif
++
+   /* Find identical prefix.  */
+ 
+   word *w0 = filevec[0].buffer;

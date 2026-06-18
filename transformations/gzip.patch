@@ -1,0 +1,44 @@
+--- a/deflate.c	2026-06-06 10:06:12.656518286 +0000
++++ b/deflate.c	2026-06-06 10:07:13.378405749 +0000
+@@ -81,6 +81,10 @@
+ #include "gzip.h"
+ #include "lzw.h" /* just for consistency checking */
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#endif
++
+ /* ===========================================================================
+  * Configuration parameters
+  */
+@@ -282,7 +286,30 @@
+  *    input characters, so that a running hash key can be computed from the
+  *    previous key instead of complete recalculation each time.
+  */
++#ifdef KLEE_BITCODE
++/* Under symbolic execution, the input file bytes are symbolic, so the
++ * rolling hash `h` computed from window[] becomes a symbolic value. It is
++ * then used to index the global hash tables (head[ins_h], and through
++ * head -> the prev[] hash chain read `prev[cur_match & WMASK]`). A symbolic
++ * index into a large global forces KLEE to hand the WHOLE array to the
++ * solver: KLEE warns
++ *   "Symbolic memory write ... 131072 bytes ... global:prev"
++ * and a SINGLE deflate query then runs 800-1380 s, wedging every searcher
++ * on gzip's DEFAULT (compress) path before any other code is explored
++ * (diagnosed: deflate.c:748 owns 850-1380 s of Qtime across bfs/empc/nurs:rp).
++ *
++ * Concretizing the hash collapses head[]/prev[] back to constant-index array
++ * ops. klee_get_value picks one satisfying concrete hash and continues; the
++ * hash is a pure deterministic function of bytes the solver is already
++ * tracking, so this neither adds nor drops feasible paths — it only stops
++ * deflate's dictionary bookkeeping from being a symbolic-array-index sink.
++ * The coverage oracle (program.cov) is built WITHOUT -DKLEE_BITCODE, so the
++ * real hash runs on ktest replay and observed coverage is unaffected. */
++#define UPDATE_HASH(h,c) \
++   (h = klee_get_value_i32((((h)<<H_SHIFT) ^ (c)) & HASH_MASK))
++#else
+ #define UPDATE_HASH(h,c) (h = (((h)<<H_SHIFT) ^ (c)) & HASH_MASK)
++#endif
+ 
+ /* ===========================================================================
+  * Insert string s in the dictionary and set match_head to the previous head

@@ -1,0 +1,57 @@
+diff -urN a/src/tool_main.c b/src/tool_main.c
+--- a/src/tool_main.c	2026-06-01 00:00:00.000000000 +0000
++++ b/src/tool_main.c	2026-06-01 00:00:00.000000000 +0000
+@@ -36,6 +36,10 @@
+ #include "tool_main.h"
+ #include "tool_stderr.h"
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#endif
++
+ #ifdef __VMS
+ /*
+  * vms_show is a global variable, used in main() as parameter for
+@@ -123,6 +127,42 @@
+ {
+   CURLcode result = CURLE_OK;
+ 
++#ifdef KLEE_BITCODE
++  {
++    static const char *const modes[] = {
++      "-h",
++      "-V",
++      "-M"
++    };
++    static const char help_arg[] = "all";
++    const char *flag = modes[0];
++    unsigned mode;
++    unsigned i;
++    unsigned k;
++
++    mode = (unsigned)klee_range(0, 3, "curl_cli_mode");
++    for(k = 1; k < 3; k++) {
++      if(mode == k)
++        flag = modes[k];
++    }
++
++    klee_assume(argc == 3);
++    for(i = 0; flag[i]; i++) {
++      klee_assume(argv[1][i] == flag[i]);
++      argv[1][i] = flag[i];
++    }
++    klee_assume(argv[1][i] == '\0');
++    argv[1][i] = '\0';
++
++    for(i = 0; help_arg[i]; i++) {
++      klee_assume(argv[2][i] == help_arg[i]);
++      argv[2][i] = help_arg[i];
++    }
++    klee_assume(argv[2][i] == '\0');
++    argv[2][i] = '\0';
++  }
++#endif
++
+   tool_init_stderr();
+ 
+ #ifdef _WIN32

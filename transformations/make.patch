@@ -1,0 +1,173 @@
+--- a/src/read.c	2026-06-09 07:54:46.943729825 +0000
++++ b/src/read.c	2020-01-01 00:00:00.000000000 +0000
+@@ -18,6 +18,10 @@
+ 
+ #include <assert.h>
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#endif
++
+ #include "filedef.h"
+ #include "dep.h"
+ #include "job.h"
+@@ -436,6 +440,149 @@
+   ebuf.size = 200;
+   ebuf.buffer = ebuf.bufnext = ebuf.bufstart = xmalloc (ebuf.size);
+ 
++#ifdef KLEE_BITCODE
++  /* make input-menu-pin (steering).  Round-2 transformation; supersedes the
++     shelved makefile-content-pin (round 1, which klee_assume'd the symbolic
++     file to ONE valid makefile but never CONCRETIZED the parse buffer, so
++     make's readline/fgets ran the constrained-symbolic bytes through the
++     parser, hit the 8 KiB symbolic-array solver tax, and terminated 0 states
++     -> 0 ktests -> 0 replay lines on every searcher).
++
++     Mechanism (the sanctioned three-step input-menu-pin, cf. bc
++     unified-multipin / diffutils formatter-menu-pin): coverage is measured by
++     replaying each emitted .ktest on the CONCRETE program.cov binary, so a
++     ktest is only useful if (a) its A_data bytes form a VALID makefile and
++     (b) the KLEE state TERMINATES to emit it.  Baseline ktests are all empty /
++     garbage makefiles (A_data = "\n\n..." or junk) that make rejects fast ->
++     they cover only the early-exit code, leaving function.c / commands.c /
++     remake.c near-zero.  Here we:
++       1. klee_range over a menu of N complete, valid, 40-byte makefiles
++          (one fork per entry -- bounded, not per-byte);
++       2. read the 40 symbolic bytes of file `A` and klee_assume each equals
++          the chosen entry, so the emitted ktest's A_data REPLAYS that exact
++          makefile on the cov binary; and
++       3. switch ebuf to make's own string-buffer mode (fp=NULL ->
++          readstring, no fgets / no symbolic FD) backed by a CONCRETE copy of
++          the entry, so the parse is fork-free and the state terminates.
++     Each menu entry is padded to the full 40-byte symbolic width (no symbolic
++     tail) so nurs:md2u doesn't chase a tail to 0 ktests (the documented menu
++     full-width rule).  Bitcode-only: the cov binary never sees klee_*.  */
++  if (ebuf.fp != NULL && filename != NULL
++      && filename[0] == 'A' && filename[1] == '\0')
++    {
++      /* Menu of complete, valid, 40-byte makefiles.  Each exercises a
++         different read.c / variable.c / function.c / rule path; trailing
++         blank lines pad to EXACTLY 40 bytes (parser no-op) so no symbolic tail
++         remains (the nurs:md2u full-width rule).  Round 6 (52 entries) added 11 read.c/variable.c residual entries (subst-refs, !=, ::=, computed names, eval, define-recipe).  Round 5 (41 entries) added 13
++         read.c directive/construct entries (override/private/undefine/
++         unexport/ifdef/ifndef/else/vpath/-include/double-colon/.PHONY/
++         order-only/target-specific-var) -- read.c was the biggest reachable
++         residual at 910/2070.  Round 4 (28 entries): the
++         builtin $(...) function entries now use ':=' (IMMEDIATE) assignment so
++         the handler runs at PARSE time even with a '@:' recipe -- Round 3 used
++         '=' (recursive/lazy) + '@:', which never referenced the var, so
++         func_patsubst/func_filter/... were registered but NEVER CALLED and
++         function.c stayed flat at 183/1381 (proven by an $(info) probe: '=' +
++         '@:' prints nothing, ':=' fires the arg's $(info)).  Round 4 also adds
++         big uncovered handlers (call/intcmp/value/origin/firstword/suffix/
++         wordlist/filter-out/strip/addsuffix) with non-trivial args.  Each
++         verified to run clean (exit 0) on the concrete cov binary under -n.  */
++      static const char kmenu[][41] = {
++        "all:;@echo hi\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* rule+recipe */
++        "ifeq (1,1)\nall:;@:\nendif\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* ifeq */
++        "all: a.o\na.o:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* prereq */
++        "define V\nz\nendef\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* define */
++        "all: b\nb: c\nc:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* multi-prereq */
++        "export E:=1\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* export */
++        "a?=1\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* ?= */
++        "b:=x\nb+=y\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* += */
++        "x:=$(subst a,b,banana)\nall:;@:\n\n\n\n\n\n\n\n\n\n",  /* subst */
++        "y:=$(if ,p,q)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* if */
++        "p:=$(patsubst %.c,%.o,a.c b.c)\nall:;@:\n\n",  /* patsubst */
++        "f:=$(filter %.c,a.c b.o)\nall:;@:\n\n\n\n\n\n\n\n",  /* filter */
++        "fo:=$(filter-out a,a b)\nall:;@:\n\n\n\n\n\n\n\n\n",  /* filter-out */
++        "w:=$(words a b c)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* words */
++        "d:=$(dir a/b c/d)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* dir */
++        "s:=$(sort c a b a)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* sort */
++        "e:=$(foreach v,1 2,x$v)\nall:;@:\n\n\n\n\n\n\n\n\n",  /* foreach */
++        "g:=$(strip  a  b )\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* strip */
++        "i:=$(findstring a,bac)\nall:;@:\n\n\n\n\n\n\n\n\n\n",  /* findstring */
++        "j:=$(addsuffix .o,a b)\nall:;@:\n\n\n\n\n\n\n\n\n\n",  /* addsuffix */
++        "k:=$(wordlist 1,2,a b c)\nall:;@:\n\n\n\n\n\n\n\n",  /* wordlist */
++        "m:=$(notdir a/b c/d)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n",  /* notdir */
++        "cl:=$(call f,1,2)\nf=$1$2\nall:;@:\n\n\n\n\n\n\n\n",  /* call */
++        "ic:=$(intcmp 1,2,l,e,g)\nall:;@:\n\n\n\n\n\n\n\n\n",  /* intcmp */
++        "vl:=$(value V)\nV=x\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* value */
++        "or:=$(origin V)\nV=x\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* origin */
++        "fw:=$(firstword a b)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n",  /* firstword */
++        "sf:=$(suffix a.c b.o)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n",  /* suffix */
++        /* Round 5: read.c directives/constructs (the biggest reachable
++           residual, read.c 910/2070).  Each a distinct word1eq / parse arm. */
++        "override O:=1\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* override */
++        "private P:=1\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* private */
++        "undefine U\nU:=1\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* undefine */
++        "V:=1\nunexport V\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* unexport */
++        "X=1\nifdef X\nall:;@:\nendif\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* ifdef */
++        "ifndef X\nall:;@:\nendif\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* ifndef */
++        "ifeq (a,b)\nx=1\nelse\nall:;@:\nendif\n\n\n\n\n\n\n",  /* else */
++        "vpath %.c src\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* vpath */
++        "-include none\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* -include */
++        "a::\n\t@:\nall: a\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* double-colon */
++        ".PHONY: all\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* special-target */
++        "all: | b\nb:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* order-only */
++        "t: V:=x\nall: t\nt:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* target-specific-var */
++        /* Round 6: read.c/variable.c residual constructs — substitution refs,
++           shell-assign, simple-expand, computed names, eval, define-recipe. */
++        "V:=a.c b.c\nx:=$(V:.c=.o)\nall:;@:\n\n\n\n\n\n\n\n",  /* subst-ref .c=.o */
++        "V:=a.c\nx:=$(V:%.c=%.o)\nall:;@:\n\n\n\n\n\n\n\n\n\n",  /* subst-ref pattern */
++        "n!=echo z\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* != shell-assign */
++        "x::=1\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* ::= simple */
++        "y=z\nx=y\nv:=$($x)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* computed name */
++        "$(eval all:;@:)\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* eval */
++        "define R\n@:\nendef\nall:;$(R)\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* define-recipe-call */
++        "V:=a b\nx:=$(V:=.o)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* subst-ref suffix-add */
++        "a:=1\nb:=$(a)$(a)\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* var-ref concat */
++        "# comment\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* comment */
++        ".DEFAULT:;@:\nall:;@:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",  /* .DEFAULT special */
++      };
++      const int knmenu = (int) (sizeof (kmenu) / sizeof (kmenu[0]));
++      unsigned ksel = (unsigned) klee_range (0, knmenu, "make_menu_sel");
++      const char *kp = kmenu[0];
++      int kk;
++      /* Concrete pointer in each forked state (no symbolic array index).  */
++      for (kk = 1; kk < knmenu; kk++)
++        if (ksel == (unsigned) kk)
++          kp = kmenu[kk];
++
++      /* Read the 40 symbolic bytes of `A` and pin them to the chosen entry so
++         the emitted ktest replays this makefile on the cov binary.  */
++      {
++        char ksym[40];
++        size_t kn = fread (ksym, 1, sizeof (ksym), ebuf.fp);
++        int ki;
++        for (ki = 0; ki < (int) kn && ki < 40; ki++)
++          klee_assume (ksym[ki] == kp[ki]);
++      }
++
++      /* Switch ebuf to string-buffer mode backed by a CONCRETE copy of the
++         entry: fp=NULL routes readline -> readstring (no fgets, no symbolic
++         FD), so the parse is fork-free and terminates.  size excludes the
++         terminating NUL (readstring scans for '\n' within [bufstart,
++         bufstart+size)).  Close the real FILE* now and NULL it; the post-eval
++         fclose is guarded below so it is not double-closed.  */
++      {
++        size_t klen = strlen (kp);
++        char *kbuf = xmalloc (klen + 1);
++        memcpy (kbuf, kp, klen + 1);
++        free (ebuf.bufstart);
++        ebuf.buffer = ebuf.bufnext = ebuf.bufstart = kbuf;
++        ebuf.size = klen;
++        fclose (ebuf.fp);
++        ebuf.fp = NULL;
++      }
++    }
++#endif
++
+   curfile = reading_file;
+   reading_file = &ebuf.floc;
+ 
+@@ -443,7 +590,8 @@
+ 
+   reading_file = curfile;
+ 
+-  fclose (ebuf.fp);
++  if (ebuf.fp != NULL)
++    fclose (ebuf.fp);
+ 
+   free (ebuf.bufstart);
+   free_alloca ();

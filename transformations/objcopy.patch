@@ -1,0 +1,55 @@
+--- a/binutils/objcopy.c	2026-06-06 23:36:26.713885918 +0000
++++ b/binutils/objcopy.c	2026-06-06 23:36:26.834884967 +0000
+@@ -32,6 +32,13 @@
+ #include "safe-ctype.h"
+ #include "plugin.h"
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#include <fcntl.h>
++#include <unistd.h>
++static void klee_assume_arg(const char*a,const char*e){int i;for(i=0;e[i];i++)klee_assume(a[i]==e[i]);klee_assume(a[i]==0);}
++#endif
++
+ /* FIXME: See bfd/peXXigen.c for why we include an architecture specific
+    header in generic PE code.  */
+ #include "coff/i386.h"
+@@ -6281,6 +6288,38 @@
+   program_name = argv[0];
+   xmalloc_set_program_name (program_name);
+ 
++#ifdef KLEE_BITCODE
++  /* round-21 (SHIPPED): ELF-core + symbolsrec + a FAST usage cohort (3-way menu).
++     The usage cohort (argc==4, two extra non-option args) hits copy_usage's
++     'too many positional args' bail (objcopy.c:6156) and exit()s immediately —
++     no BFD work, so it terminates instantly and does NOT starve the slow ELF/
++     symbolsrec cohorts (unlike the slow text cohorts of r8/r12). Goal: recover
++     the copy_usage lines symbolsrec lost on empc (r18 −17) while keeping the
++     +127 srec.c symbol-path gain. */
++  klee_assume (argc == 2 || argc == 4);
++  if (argc == 4)
++    {
++      /* usage cohort: two extra non-option positional args before A => >2
++         positionals => copy_usage. Pin them to short non-'-' strings. */
++      klee_assume_arg (argv[1], "x");
++      klee_assume_arg (argv[2], "y");
++    }
++  else
++    {
++      static const unsigned char klee_pin_elf[84] = { 0x7f, 0x45, 0x4c, 0x46, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x34, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x04, 0x08, 0x00, 0x80, 0x04, 0x08, 0x54, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00 };
++      static const unsigned char klee_pin_sym[60] = { 0x24, 0x24, 0x20, 0x6d, 0x0a, 0x20, 0x20, 0x73, 0x20, 0x24, 0x31, 0x0a, 0x24, 0x24, 0x0a, 0x53, 0x31, 0x30, 0x35, 0x30, 0x30, 0x30, 0x30, 0x30, 0x31, 0x30, 0x32, 0x46, 0x37, 0x0a, 0x53, 0x39, 0x30, 0x33, 0x30, 0x30, 0x30, 0x30, 0x46, 0x43, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a };
++      int kfmt = klee_range (0, 2, "objcopy_r21_fmt");
++      int kfd = open ("A", O_RDONLY);
++      if (kfd >= 0) {
++        unsigned char kbuf[84];
++        ssize_t kn = read (kfd, kbuf, sizeof (kbuf));
++        close (kfd);
++        if (kfmt == 0) { if (kn>=(ssize_t)84) for(int ki=0;ki<84;ki++) klee_assume(kbuf[ki]==klee_pin_elf[ki]); }
++        else { if (kn>=(ssize_t)60) for(int ki=0;ki<60;ki++) klee_assume(kbuf[ki]==klee_pin_sym[ki]); }
++      }
++    }
++#endif
++
+   expandargv (&argc, &argv);
+ 
+   strip_symbols = STRIP_UNDEF;

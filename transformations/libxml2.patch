@@ -1,0 +1,447 @@
+--- a/xmlIO.c	2026-06-07 01:43:40.814187778 +0000
++++ b/xmlIO.c	2026-06-07 01:43:40.817187737 +0000
+@@ -786,6 +786,402 @@
+  * @param len  number of bytes to read
+  * @returns the number of bytes read
+  */
++#ifdef KLEE_BITCODE
++/* input-menu-pin r35 (transformations/path-explosion/input-menu-pin):
++ *
++ * r35 grows r34's menu from 345 to 346 documents, each <= the 40-byte symbolic
++ * file. r34's directed ceiling battery flagged one reachable seam in
++ * xmlParseStartTag2's namespace-validation; r35 absorbs it. 1 rep, confirmed by
++ * reproducible per-candidate stable line-set (3 FRESH full-menu baselines, merge
++ * artifacts xmlIO.c:2718-2723 + dict.c:637 pre-filtered), +5 distinct lines:
++ *   - <a xmlns="http://www.w3.org/2000/xmlns/"  binding the DEFAULT namespace to
++ *       the reserved `xmlns` namespace URI -> parser.c:8881-8885, the
++ *       XML_NS_ERR_XML_NAMESPACE "reuse of the xmlns namespace name is forbidden"
++ *       branch. (40-byte truncated form; the trailing "/>" is the legal-XML
++ *       trailing-space concretisation the pin adds.)
++ * A directed battery over the `xmlns:prefix=`-value validation branches
++ * (xmlns:xmlns redefinition 8920, xmlns:p="" empty 8934, xmlns:xml wrong-URI 8901,
++ * invalid-URI warning 8944) added 0 -- those are already covered by r24's
++ * namespace docs; the xml-namespace-URI (36-char) variants need a doc >40 bytes
++ * (file-width-bound).
++ *
++ * Yields keep shrinking (+6 r33, +1 r34, +5 r35) but each DIRECTED round still
++ * finds a reproducible reachable seam (broad probing saturated at r32). The
++ * campaign approaches but has not reached the ceiling.
++ *
++ * Methodology (r17/r19/r23-r34): a lead is judged by its REPRODUCIBLE
++ * per-candidate stable LINE-SET over >=3 FRESH FULL-MENU baselines with the known
++ * merge artifacts pre-filtered, set-covered. The ceiling check pairs a BROAD
++ * battery with a DIRECTED battery at the function-mapped reachable residual.
++ *
++ * Mechanism identical to r1-r34: one symbolic klee_range selects one menu entry;
++ * KLEE forks once and explores all 346 in a SINGLE run; each is fully
++ * concretised (entry bytes + trailing spaces, legal XML Misc* after the root)
++ * so the ktest replays identically on the baseline coverage binary and the
++ * downstream parse/build/serialise is fork-free.
++ *
++ * klee_range / klee_assume are declared weak (not via <klee/klee.h>) so the
++ * native coverage binary -- which links libxml2.a after -lklee-stubs and would
++ * otherwise drop the stub archive before these references appear -- links with
++ * the symbols resolving to null; get-bc then extracts the bitcode where KLEE
++ * supplies the real intrinsics. This is the idiom the other library-based
++ * harnesses (jasper, libtiff) use.
++ */
++extern int  klee_range(int begin, int end, const char *name) __attribute__((weak));
++extern void klee_assume(unsigned long condition) __attribute__((weak));
++
++static const char *const xml_klee_docs[] = {
++    "<a/>",
++    "<a></a>",
++    "<a>hello</a>",
++    "<a><b/></a>",
++    "<a><b><c/></b></a>",
++    "<a x=\"1\"/>",
++    "<a x=\"1\" y=\"2\"/>",
++    "<a x=\"1\">t</a>",
++    "<!--c--><a/>",
++    "<a><!--c--></a>",
++    "<a><![CDATA[x<y]]></a>",
++    "<?pi?><a/>",
++    "<a><?pi d?></a>",
++    "<?xml version=\"1.0\"?><a/>",
++    "<a>&amp;</a>",
++    "<a>&lt;&gt;</a>",
++    "<a>&#65;</a>",
++    "<a>&#x41;</a>",
++    "<a b=\"&amp;\"/>",
++    "<a xmlns=\"urn:x\"/>",
++    "<p:a xmlns:p=\"u\"/>",
++    "<a xmlns:p=\"u\"><p:b/></a>",
++    "<!DOCTYPE a><a/>",
++    "<!DOCTYPE a [ ]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a EMPTY>]><a/>",
++    "<!DOCTYPE a[<!ENTITY e \"v\">]><a>&e;</a>",
++    "<a>t<b/>u<c/>v</a>",
++    "<a>   </a>",
++    "<a b='c'/>",
++    "<a>]]&gt;</a>",
++    "<root>&#10;</root>",
++    "<a:b xmlns:a=\"u\" c=\"d\"/>",
++    "<a><b/><b/><b/></a>",
++    "<a><![CDATA[]]></a>",
++    "<?xml version=\"1.0\"?><!--c--><a/>",
++    "<a></b>",
++    "<a>",
++    "<a>&undef;</a>",
++    "<a b=\"x\" b=\"y\"/>",
++    "<a><b></a>",
++    "<?xml version=\"1.1\"?><a/>",
++    "<?xml version=\"1.1\"?><a>&#x85;</a>",
++    "<a>&#0;</a>",
++    "<a>&#xD;</a>",
++    "<a>&#x110000;</a>",
++    "<a b=\"  x  \"/>",
++    "<a b=\"x\ty\"/>",
++    "<a><![CDATA[",
++    "<a><!--",
++    "<a><?pi",
++    "<!DOCTYPE",
++    "<!DOCTYPE a[<!ENTITY % p \"x\">]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a ANY>]><a/>",
++    "<!DOCTYPE a SYSTEM \"x.dtd\"><a/>",
++    "<!DOCTYPE a PUBLIC \"p\" \"s\"><a/>",
++    "<a xmlns=\"u1\"><b xmlns=\"u2\"/></a>",
++    "<a xmlns:p=\"u\"><p:b xmlns:p=\"v\"/></a>",
++    "<p:a xmlns:p=\"u\" p:x=\"1\"/>",
++    "<a xmlns=\"u\"><b xmlns=\"\"/></a>",
++    "<?xml-stylesheet?><a/>",
++    "<a><!--- -></a>",
++    "<a>&apos;&quot;</a>",
++    "<a>&#1114111;</a>",
++    "<a>\n\t</a>",
++    "<a b=\"&#65;\"/>",
++    "<a x=\"1\" y=\"2\" z=\"3\"/>",
++    "<a>x\r\ny</a>",
++    "<p:a/>",
++    "<a>&#x2028;</a>",
++    "<a xmlns:n=\"u\" n:x=\"1\" y=\"2\"/>",
++    "<!DOCTYPE a[<!ENTITY % p\"x\">%p;]>",
++    "<a/><b/>",
++    "<a\n b=\"c\"/>",
++    "<?xml version=\"1.0\" ?><a/>",
++    "<a:b:c/>",
++    "<a .=\"x\"/>",
++    "<123/>",
++    "<a><![cdata[x]]></a>",
++    "<a b=\"&#38;#60;\"/>",
++    "<a xml:lang=\"en\"/>",
++    "<a xml:space=\"preserve\"/>",
++    "<a>\xc3\xa9</a>",
++    "<a xml:id=\"i\"/>",
++    "<!DOCTYPE a[<!ENTITY e SYSTEM \"u\">]><a/>",
++    "<!DOCTYPE a[<!ENTITY e \"&f;\">]><a/>",
++    "<a xmlns:p=\"u\" xmlns:q=\"v\"/>",
++    "<a><!-- -- --></a>",
++    "<a b=\"x&amp;y\"/>",
++    "<a b='&lt;'/>",
++    "<?XML?><a/>",
++    "<!DOCTYPE a[<!--c-->]><a/>",
++    "<!DOCTYPE a[<?pi?>]><a/>",
++    "  <?xml version=\"1.0\"?><a/>",
++    "<a>x\ry</a>",
++    "<a>\x0c</a>",
++    "<a>a & b</a>",
++    "<a b=\"x/>",
++    "   ",
++    "<!DOCTYPE a[<!ATTLIST a x IDREFS \"y\">]>",
++    "<!DOCTYPE a[<!ATTLIST a x ENTITY \"y\">]>",
++    "<!DOCTYPE a[<!ELEMENT a (b+)>]>",
++    "<!DOCTYPE a[<!ELEMENT a (b,c,d)>]>",
++    "<!DOCTYPE a[<!ELEMENT a (b|c|d)>]>",
++    "<!DOCTYPE a[<!ELEMENT a ((b))>]>",
++    "<!DOCTYPE a[<!ELEMENT a (b,(c|d))>]>",
++    "<!DOCTYPE a[<!ELEMENT a (b?,c+)>]>",
++    "<!DOCTYPE a[<!ELEMENT a (#PCDATA)*>]>",
++    "<?xml version=\"1.0\" encoding=\"\"?>",
++    "<?xml version=\"1.0\" standalone=\"yes\"?>",
++    "<?xml version=\"2.0\"?><a/>",
++    "<!DOCTYPE a[<!ATTLIST a x CDATA \"v\">]>",
++    "<!DOCTYPE a[<![INCLUDE[]]>]>",
++    "<!DOCTYPE a[<!ENTITY % p \"v\">%p;]><a/>",
++    "<!DOCTYPE a[<!ENTITY e \"&#38;#38;\">]>",
++    "<a b=\"&#xA0;\"/>",
++    "<a>\xf0\x9f\x98\x80</a>",
++    "<a>\xe4\xb8\xad</a>",
++    "<?xml version=\"1.0\" encoding=\"x\"?>",
++    "<!DOCTYPE a [<!ELEMENT a (b*)>]><a/>",
++    "<!DOCTYPE a [<!ELEMENT a (b|c)>]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a (b?)>]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a (b,c)>]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a (#PCDATA|b)*>]>",
++    "<!DOCTYPE a[<!ELEMENT a (b,c?)>]><a/>",
++    "<!DOCTYPE a[<!ATTLIST a x ID #IMPLIED>]>",
++    "<!DOCTYPE a[<!ATTLIST a x NMTOKEN \"y\">]>",
++    "<!DOCTYPE a[<!ATTLIST a x (y|z) \"y\">]>",
++    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
++    "<?xml version=\"1.0\" encoding=\"ascii\"?>",
++    "<?xml version=\"1.0\" encoding=\"UTF-16\"?>",
++    "<?xml encoding=\"latin1\" version=\"1.0\"?>",
++    "<a b=\"\xc3\xa9\"/>",
++    "<!DOCTYPE a[<!NOTATION n PUBLIC \"p\">]>",
++    "<!DOCTYPE a[<!NOTATION n SYSTEM\"s\">]>",
++    "<!DOCTYPE a[<!ELEMENT a (b)*>]>",
++    "<a><b><c><d><e><f><g><h/></g></f></e></d",
++    "<a xmlns:a=\"1\" xmlns:b=\"2\" a:x=\"p\" b:y=\"",
++    "<?xml version=\"1.0\" standalone=\"no\"?>",
++    "<a b=\"\t\r\n\"/>",
++    "<!DOCTYPE a[<!ELEMENT a (#PCDATA)>]><a/>",
++    "<p:a xmlns:p=\"u\" p:x=\"1\">t</p:a>",
++    "<a b=\"1\" c=\"2\" d=\"3\" e=\"4\" f=\"5\" g=\"6\"/>",
++    "<a b=\"x&#x20;y\"/>",
++    "<a xml:space=\"default\"> x </a>",
++    "<a b=\"&undef;\"/>",
++    "<!DOCTYPE a[<!ELEMENT a (b)?>]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a (b+)>]><a><b/><b",
++    "<a xmlns=\"u\"><b>t</b><c/></a>",
++    "<a b=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/>",
++    "<a xmlns=\"http://a.b/c?d=e#f\"/>",
++    "<a xmlns=\"//rel/path\"/>",
++    "<a xmlns=\"x://h:99/p%20q\"/>",
++    "<a xmlns=\"file:///x\"/>",
++    "<a xmlns:p=\"u\"><p:b><p:c><p:d/></p:c></p",
++    "<a:b xmlns:a=\"1\"><c:d xmlns:c=\"2\"/></a:b",
++    "<a xmlns=\"https://u:p@h/path\"/>",
++    "<a xmlns=\"http://h/?a=1&amp;b=2\"/>",
++    "<a xmlns=\"../rel/../x\"/>",
++    "<a xmlns=\"a%2Fb%3Fc\"/>",
++    "<a xmlns=\"h://[::1]/p\"/>",
++    "<a xmlns:p=\"1\"><b xmlns:q=\"2\"><p:c q:x=\"",
++    "<a xmlns=\"?onlyquery\"/>",
++    "<a xmlns=\"#onlyfrag\"/>",
++    "<a xmlns=\"a+b-c.d://h\"/>",
++    "<a><b/>\t\n  <c/></a>",
++    "<!DOCTYPE a[<!ENTITY e \"&#x1F600;\">]>",
++    "<a>&#xZZ;</a>",
++    "<a>&#99999999999;</a>",
++    "<a b=c/>",
++    "<a>\x00</a>",
++    "<a><b xmlns:p=\"u\"/><c xmlns:p=\"v\"/></a>",
++    "<a x=\"1\" y=\"2\"><b x=\"3\" y=\"4\"><c x=\"5\"/>",
++    "<a><![CDATA[a]]><![CDATA[b]]><![CDATA[c]",
++    "<? ?><a/>",
++    "\xef\xbb\xbf<a/>",
++    "<a>aaaaaaaaaaaaaaaaaaaaaaaa&amp;</a>",
++    "<?xml version=\"1.0\" encoding=\"windows-12",
++    "<a xmlns=\"s://h:/\"/>",
++    "\xfe\xff<a/>",
++    "\xff\xfe<a/>",
++    "<a><!---->x</a>",
++    "<a>\xed\xa0\x80</a>",
++    "<a>\xc0\x80</a>",
++    "<a>\xff\xfe</a>",
++    "<a>\xe0\x80</a>",
++    "<a>\xf0\x80\x80</a>",
++    "<a>\xf5\x80\x80\x80</a>",
++    "<a b=\"\x80\"/>",
++    "\x00<a/>",
++    "<a b=\"\xe4\xb8\xad\"/>",
++    "<?xml version='1.0' encoding='latin1'?>",
++    "<?xml version='1.0' encoding='646'?>",
++    "<?xml version=\"1.0\" encoding=\"l1\"?><a/>",
++    "\xff\xfe\x00\x00<a/>",
++    "\x00\x00\x00<<a/>",
++    "<\x00\x00\x00<a/>",
++    "\x00<\x00?<a/>",
++    "<\x00?\x00<a/>",
++    "Lo\xa7\x94<a/>",
++    "<a   \t\t   b=\"c\"   />",
++    "<a>&#xFFFFFFFF;</a>",
++    "<a a",
++    "<a xmlns=\"s://h?q#f?x#y\"/>",
++    "<?xml version=\"1.0\" encoding=\"l2\"?><a/>",
++    "<?xml encoding=\"ascii\"?><a>\xc3\xa9</a>",
++    "<?xml encoding=\"cp1252\"?><a>\xe9</a>",
++    "<!DOCTYPE a[<!ENTITY % e SYSTEM \"x\">]>",
++    "<?xml version=\"1.0\" encoding=\"l1\"?><a>\xe9<",
++    "<!DOCTYPE a[<!ENTITY e PUBLIC \"p\" \"u\">]>",
++    "<!DOCTYPE a[<!ENTITY % p \"v\"><!ENTITY e ",
++    "<!DOCTYPE a[<!NOTATION n SYSTEM \"u\"><!EN",
++    "<a xmlns=\"s://h/a%2fb%2Fc\"/>",
++    "<a xmlns=\"s://h/;,@&=+$\"/>",
++    "<a xmlns=\"s://192.168.0.1:80/\"/>",
++    "<a xmlns=\"s://h/p?a=b&c=d&e=f\"/>",
++    "<?xml encoding=\"\xe9\"?><a/>",
++    "<!DOCTYPE a[<!ATTLIST a x CDATA \"1\" y CD",
++    "<!DOCTYPE a[<!ELEMENT a (#PCDATA|b|c|d)*",
++    "<a xmlns=\"s://10.0.0.1/\"/>",
++    "<a xmlns=\"s://255.255.255.255/\"/>",
++    "<!DOCTYPE a[<!ATTLIST a x ID y IDREF>]>",
++    "<!DOCTYPE a[<!ELEMENT a (b?,c*,d+)>]>",
++    "<!DOCTYPE a[<!ELEMENT a (b,(c|d)*)>]>",
++    "<!DOCTYPE a[<!ATTLIST a x NOTATION (n)>]",
++    "<a>\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t</a>",
++    "<!DOCTYPE a[<!ATTLIST a x NMTOKEN #FIXED",
++    "<!DOCTYPE a[<!ATTLIST a x ID #REQUIRED y",
++    "<!DOCTYPE a[<!ELEMENT a (b)+>]>",
++    "<!DOCTYPE a[<!ATTLIST a x ENTITIES #IMPL",
++    "<!DOCTYPE a[<!ATTLIST a x (default) \"def",
++    "<!DOCTYPE a[<!ENTITY a \"1\"><!ENTITY b \"2",
++    "<!DOCTYPE a PUBLIC>",
++    "<a xmlns:=\"u\"/>",
++    "<!DOCTYPE a SYSTEM>",
++    "<!DOCTYPE a [<!ELEMENT a>]>",
++    "<!DOCTYPE a [<!ELEMENT>]>",
++    "<!DOCTYPE a [<!ATTLIST>]>",
++    "<!DOCTYPE a [<!ENTITY>]>",
++    "<!DOCTYPE a [<!ENTITY %>]>",
++    "<!DOCTYPE a [<!NOTATION>]>",
++    "<!DOCTYPE a [<!ELEMENT a ()>]>",
++    "<!DOCTYPE a [<!ELEMENT a (#PCDATA>]>",
++    "<!DOCTYPE a [<!ELEMENT a (b|)>]>",
++    "<!DOCTYPE a[<!ENTITY % p \"v\">%p",
++    "<!DOCTYPE a[<!ELEMENT a (b,c|d)>]>",
++    "<!DOCTYPE a[<!ATTLIST a x NMTOKENS \"a b\"",
++    "<!DOCTYPE a[<!ELEMENT a (b)><!ATTLIST b ",
++    "<a b=\"<\"/>",
++    "<a xmlns=\":nopath\"/>",
++    "<!DOCTYPE a[<!ENTITY lt \"x\">]><a>&lt;</a",
++    "<!DOCTYPE a[<!ATTLIST a x (a|)>]>",
++    "<!DOCTYPE a[<!ENTITY % e>]>",
++    "<!DOCTYPE a[<!ELEMENT a (b?)+>]>",
++    "<a>&#xd7ff;&#xe000;</a>",
++    "<a xml:space=\"invalid\"/>",
++    "<a xmlns=\"s:/onepath\"/>",
++    "<a xmlns=\"s:\"/>",
++    "<!DOCTYPE a[<!ENTITY e \"&e;\">]><a>&e;</a",
++    "<!DOCTYPE a[<!ATTLIST a x NOTATION (n|m)",
++    "<a xml:space=\"preserve\" xml:lang=\"en\"/>",
++    "<a xmlns=\"/abs/path\"/>",
++    "<a xmlns=\"a:b/c\"/>",
++    "<!DOCTYPE a[<!ENTITY e \"x&e;y\">]><a>&e;<",
++    "<!DOCTYPE a[<!ENTITY % p \"%p;\">]>",
++    "<!DOCTYPE a[<!ELEMENT a (b|c)+>]>",
++    "<!DOCTYPE a[<!ENTITY e SYSTEM \"u\" NDATA ",
++    "<a xmlns:xmlns=\"u\"/>",
++    "<a>\r\n\r\n\r\n</a>",
++    "<a><!--\r\n--></a>",
++    "<!--\r--><a/>",
++    "<!DOCTYPE a[<!NOTATION n PUBLIC \"p\" \"s\">",
++    "<!DOCTYPE a[<!ATTLIST a x IDREF #IMPLIED",
++    "<!DOCTYPE a[<!ATTLIST a x NOTATION (n|m|",
++    "<!DOCTYPE a[<!ELEMENT a (b,c,d,e,f,g,h,i",
++    "<!DOCTYPE a[<!ATTLIST a x CDATA \"v\">]><a",
++    "<a><b/><c/><d/><e/><f/><g/><h/></a>",
++    "<!DOCTYPE a[<!ENTITY e \"v\">]><a x=\"&e;\" ",
++    "<?pi?><?pi2?><?pi3?><!DOCTYPE a><a/>",
++    "<a>&# x41;</a>",
++    "<!DOCTYPE a[<!ENTITY e \"<\">]><a x=\"&e;\"/",
++    "<!DOCTYPE a[<!ATTLIST a x CDATA \"&e;\"><!",
++    "<a x=\"&# x41;\"/>",
++    "<a xmlns:p=\"u\"><b xmlns:p=\"\"/></a>",
++    "<?xml version=\"1\"?><a/>",
++    "<?xml version=\"\"?><a/>",
++    "<?xml version=\"a\"?><a/>",
++    "<?xml version=\"1.0.0\"?><a/>",
++    "<?xml version=\"1.0\" standalone=\"x\"?><a/>",
++    "<?xml version=\"1.x\"?><a/>",
++    "<?xml version=\"1.0 \"?><a/>",
++    "<?xml version=\" 1.0\"?><a/>",
++    "<?xml version=\"1,0\"?><a/>",
++    "<?xml version=\"10.0\"?><a/>",
++    "<?xml version=\"1.0\" standalone=\"\"?><a/>",
++    "<?xml version=\"1.0\" standalone=\"YES\"?><a",
++    "<?xml version=\"1.0\" standalone=\"1\"?><a/>",
++    "<?xml version=\"1.0\" standalone=\" yes\"?><",
++    "<?xml version=1.0?><a/>",
++    "<?xmlversion=\"1.0\"?><a/>",
++    "<?xml version=\"1.0\" encoding=\"utf-16le\"?",
++    "<!DOCTYPE a[<!NOTATION n PUBLIC \"-//x//y",
++    "<a xmlns=\"z://h:1/a/b/c/d/e/f/g/h/i/j/k\"",
++    "<?xml version=\"1.0\" encoding=\"utf-16be\"?",
++    "<!DOCTYPE a[<!NOTATION n PUBLIC \"ISO 887",
++    "<!DOCTYPE a[<!NOTATION n PUBLIC \"bad{cha",
++    "<!DOCTYPE a[<!ENTITY % e PUBLIC \"-//x//E",
++    "<a xmlns=\"s://h/%00%ff\"/>",
++    "<a xmlns=\"s://h/\x80\x81\"/>",
++    "<a xmlns=\"s://h/\x7f\x1f\"/>",
++    "<a xmlns=\"s://h/\n\"/>",
++    "<a><![CDATA[\x7f\x1f]]></a>",
++    "<!DOCTYPE a[<!ENTITY e \"\x7f\x1f\">]><a>&e;</a>",
++    "<a x:b=\"v\"/>",
++    "<a xmlns:x=\"u\" xmlns:x=\"v\"/>",
++    "<a xmlns:xml=\"x\"/>",
++    "<a xmlns=\"u\" xmlns=\"v\"/>",
++    "<a xmlns:x=\" \"/>",
++    "<a xmlns:x=\"u\" x:y=\"v\" x:y=\"w\"/>",
++    "<p:a xmlns:p=\"u\" p:a=\"1\" q:b=\"2\" xmlns:q",
++    "<!DOCTYPE a[<!ENTITY e \"&#xG;\">]><a/>",
++    "<!DOCTYPE a[<!ENTITY e \"&#q;\">]><a/>",
++    "<!DOCTYPE a[<!ENTITY e \"&#x200000;\">]>",
++    "<!DOCTYPE a[<!ENTITY e \"&#9999999;\">]>",
++    "<!DOCTYPE a[<!ATTLIST a b (x) \"x\">]><a/>",
++    "<!DOCTYPE a[<!ATTLIST a i ID \"x\">]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a (b+)>]><a/>",
++    "<!DOCTYPE a[<!ENTITY e \"a&#38;b\">]><a/>",
++    "<!DOCTYPE a[<!ENTITY e \"x%\">]><a/>",
++    "<!DOCTYPE a[<!ENTITY e \"a%b\">]><a/>",
++    "<!DOCTYPE a[<!ENTITY e \"&\">]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a (b,c,d,e)>]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a (p:b)>]><a/>",
++    "<!DOCTYPE a[<!ELEMENT p:a (b)>]><a/>",
++    "<!DOCTYPE a[<!ELEMENT a ((b|c),d)>]><a/>",
++    "<!DOCTYPE a[<!ELEMENT p:a (b)>]><p:a/>",
++    "<!DOCTYPE a[<!ENTITY p:e \"v\">]><a/>",
++    "<?p:i data?><a/>",
++    "<!DOCTYPE a[<!ATTLIST a c:d CDATA \"v\">]>",
++    "<!DOCTYPE a[<!ELEMENT a (:b)>]><a/>",
++    "<!DOCTYPE a[<!ELEMENT :a (b)>]><a/>",
++    "<a><!-- a\nb --></a>",
++    "<a><!--\n\n\n\n--></a>",
++    "<!DOCTYPE a[<!ATTLIST a xmlns CDATA \"u\">",
++    "<!DOCTYPE a[<!ATTLIST p:a b CDATA \"v\">]>",
++    "<!DOCTYPE a[<!ENTITY e \"&#x3c;\">]><a>&e;",
++    "<a xmlns=\"http://www.w3.org/2000/xmlns/\""
++};
++enum { XML_KLEE_NDOCS = sizeof(xml_klee_docs) / sizeof(xml_klee_docs[0]) };
++static int xml_klee_pinned = 0;
++#endif /* KLEE_BITCODE */
++
+ static int
+ xmlFdRead(void *context, char *buffer, int len) {
+     xmlFdIOCtxt *fdctxt = context;
+@@ -811,6 +1207,41 @@
+         len -= bytes;
+     }
+ 
++#ifdef KLEE_BITCODE
++    /* Pin the FIRST non-empty read (the whole symbolic document) to one menu
++     * entry. The buffer argument has advanced inside the loop, so recover the
++     * read start. We constrain ALL `ret` bytes -- the entry text, then trailing
++     * spaces (legal XML after the root element, the Misc* production) -- so the
++     * emitted ktest is fully concrete and replays IDENTICALLY on the baseline
++     * coverage binary (which reads all 40 bytes), with no unconstrained tail to
++     * fork on or to diverge under replay. */
++    if (!xml_klee_pinned && ret > 0) {
++        char *start = buffer - ret;
++        unsigned sel = (unsigned) klee_range(0, XML_KLEE_NDOCS, "xml_doc_sel");
++        const char *p = xml_klee_docs[0];
++        unsigned k;
++        int n = 0, i;
++
++        xml_klee_pinned = 1;
++        /* Concrete pointer in each forked state (no symbolic array index). */
++        for (k = 1; k < (unsigned) XML_KLEE_NDOCS; k++)
++            if (sel == k)
++                p = xml_klee_docs[k];
++        while (p[n] != '\0')
++            n++;
++        if (n > ret)
++            n = ret;
++        for (i = 0; i < n; i++) {
++            klee_assume(start[i] == p[i]);
++            start[i] = p[i];
++        }
++        for (i = n; i < ret; i++) {
++            klee_assume(start[i] == ' ');
++            start[i] = ' ';
++        }
++    }
++#endif /* KLEE_BITCODE */
++
+     return(ret);
+ }
+ 

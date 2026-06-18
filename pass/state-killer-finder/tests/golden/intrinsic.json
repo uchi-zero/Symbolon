@@ -1,0 +1,16 @@
+{
+  "files": {},
+  "module": "intrinsic.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "UnimplementedIntrinsic": 0
+    },
+    "by_severity": {
+      "conditional": 0,
+      "definite": 0,
+      "likely": 0
+    },
+    "total_findings": 0
+  }
+}

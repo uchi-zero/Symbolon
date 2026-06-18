@@ -1,0 +1,761 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "claude-agent-sdk>=0.2.96",
+# ]
+# ///
+"""eval-symbolon — Claude Agent SDK harness that raises a program's KLEE coverage.
+
+The Claude Agent SDK drives the transformation agent; the orchestrator owns the
+*measurement* loop and the *sandbox*. Closed loop:
+
+    orchestrator runs KLEE on the (transformed) program  [--max-time-per-run]
+      -> digests run.istats + run.stats + coverage report into a feedback file
+      -> agent reads the feedback (+ raw artifacts) and the skills, then edits
+         the source (<= --max-files-per-round files; enforced by a hook)
+      -> orchestrator rebuilds + reruns KLEE ... until plateau or budget.
+
+SANDBOX (a PreToolUse hook is the sole gate):
+  * READ  : the working source tree, the skills dir, and the KLEE output dir
+            (so the agent reads its own run.istats / coverage.json).
+  * WRITE : ONLY the working source tree — writes to the skills dir or anywhere
+            else are denied. Skills / transformation refs are read-only.
+  * network + sub-agents are disabled (Bash, WebFetch, WebSearch, Task denied);
+    every tool not on the read/write whitelist is denied by default.
+  * at most --max-files-per-round distinct files may be edited per round; a
+    failed edit does not consume a slot (reserved in PreToolUse, released in
+    PostToolUseFailure).
+
+The orchestrator builds bitcode (gclang + get-bc, matching program-builder.nix)
+and runs the sibling eval-klee; the agent has no command to run KLEE itself.
+
+Run inside the program image (SYMBOLON_PROGRAM_DIR=/opt/program) or point it at
+a program dir explicitly. Auth: Claude Code ambient credentials, or
+ANTHROPIC_API_KEY (or a Bedrock/Vertex backend — pass --model "" then).
+
+Usage:
+  eval-symbolon --out DIR [--skills-dir library] [--max-rounds 20]
+                [--max-time-per-run 3m] [--time-budget 2h]
+                [--search nurs:covnew] [--max-memory 32768]
+                [--max-files-per-round 3] [--model claude-opus-4-8] [--effort high]
+  eval-symbolon --dry-run            # offline: self-test the sandbox gate, no API
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookContext,
+    HookMatcher,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+
+# Bitcode build flags mirror baselineBc in containers/lib/program-builder.nix.
+BITCODE_CFLAGS = "-O0 -g -Xclang -disable-O0-optnone"
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+EVAL_KLEE = SCRIPT_DIR / "eval-klee"
+
+
+# --------------------------------------------------------------------------- #
+# Sandbox roots + policy                                                      #
+# --------------------------------------------------------------------------- #
+# Set by configure() once the output/work/skills dirs are known. TARGET_DIR is
+# the only writable root; READ_ROOTS additionally covers the skills dir and the
+# KLEE output dir so the agent can read its own traces.
+TARGET_DIR: Path = Path()
+READ_ROOTS: tuple[Path, ...] = ()
+
+READ_TOOLS = {"Read", "Glob", "Grep", "NotebookRead"}
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+KNOWN_TOOLS = READ_TOOLS | WRITE_TOOLS
+PATH_KEYS = ("file_path", "notebook_path", "path")
+
+
+def configure(target_dir: Path, read_roots: tuple[Path, ...]) -> None:
+    global TARGET_DIR, READ_ROOTS
+    TARGET_DIR = target_dir.resolve()
+    READ_ROOTS = tuple(r.resolve() for r in read_roots)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """True iff `path` is `root` or lives beneath it (after resolving)."""
+    try:
+        resolved = (root / path if not path.is_absolute() else path).resolve()
+    except (OSError, RuntimeError):
+        return False
+    return resolved == root or root in resolved.parents
+
+
+def _paths_in(tool_input: dict) -> list[Path]:
+    out: list[Path] = []
+    for key in PATH_KEYS:
+        val = tool_input.get(key)
+        if isinstance(val, str) and val:
+            out.append(Path(val))
+    return out
+
+
+def _evaluate(tool_name: str, tool_input: dict) -> str | None:
+    """Path policy. Returns a deny-reason, or None to allow. Default-deny."""
+    if tool_name not in KNOWN_TOOLS:
+        return f"'{tool_name}' is not permitted in this sandbox."
+    is_write = tool_name in WRITE_TOOLS
+    for path in _paths_in(tool_input):
+        in_target = _is_within(path, TARGET_DIR)
+        in_readable = any(_is_within(path, r) for r in READ_ROOTS)
+        if not in_readable:
+            roots = ", ".join(str(r) for r in READ_ROOTS)
+            return f"Path '{path}' is outside the sandbox. Allowed roots: {roots}."
+        if is_write and not in_target:
+            return (f"Writes are only allowed under {TARGET_DIR}. "
+                    f"'{path}' is read-only (skill / trace material).")
+    return None
+
+
+# --- per-round file-edit cap ----------------------------------------------- #
+# Reserve a slot for a NEW file in PreToolUse; release it in PostToolUseFailure
+# (keyed by tool_use_id) so a failed edit never burns a slot. reset_round()
+# clears state at the start of each round.
+MAX_FILES = 3
+_round_files: set[Path] = set()
+_reserved_by_call: dict[str, Path] = {}
+
+
+def reset_round() -> None:
+    _round_files.clear()
+    _reserved_by_call.clear()
+
+
+def _resolve_target(path_str: str) -> Path:
+    p = Path(path_str)
+    return (TARGET_DIR / p if not p.is_absolute() else p).resolve()
+
+
+def _file_cap_reason(tool_name: str, tool_input: dict, tool_use_id: str | None) -> str | None:
+    """Enforce the cap and reserve a slot. None = allowed."""
+    if MAX_FILES is None or tool_name not in WRITE_TOOLS:
+        return None
+    paths = _paths_in(tool_input)
+    if not paths:
+        return None
+    target = _resolve_target(str(paths[0]))
+    if target in _round_files:
+        return None  # already open this round — re-edits are free
+    if len(_round_files) >= MAX_FILES:
+        edited = ", ".join(sorted(p.name for p in _round_files))
+        return (f"File limit reached: at most {MAX_FILES} files may be edited this "
+                f"round, and you have already started {len(_round_files)} ({edited}). "
+                f"'{target.name}' is a new file — denied. Concentrate remaining "
+                f"changes in the files you've already opened, then end your turn.")
+    _round_files.add(target)               # reserve
+    if tool_use_id:
+        _reserved_by_call[tool_use_id] = target
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Hooks                                                                       #
+# --------------------------------------------------------------------------- #
+async def sandbox_hook(hook_input: dict, tool_use_id: str | None, context: HookContext) -> dict:
+    """PreToolUse: enforce path policy + file cap. Explicit allow/deny so the
+    agent never falls through to interactive approval."""
+    tool_name = hook_input.get("tool_name", "")
+    tool_input = hook_input.get("tool_input", {}) or {}
+    reason = _evaluate(tool_name, tool_input) or _file_cap_reason(tool_name, tool_input, tool_use_id)
+    out: dict = {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny" if reason else "allow",
+    }}
+    if reason:
+        out["hookSpecificOutput"]["permissionDecisionReason"] = reason
+    return out
+
+
+async def release_slot_hook(hook_input: dict, tool_use_id: str | None, context: HookContext) -> dict:
+    """PostToolUseFailure: a write that this call newly reserved failed — give
+    the slot back so a typo'd edit doesn't cost the agent a file."""
+    if tool_use_id and tool_use_id in _reserved_by_call:
+        _round_files.discard(_reserved_by_call.pop(tool_use_id))
+    return {}
+
+
+# --------------------------------------------------------------------------- #
+# Skill index (library/ is a flat SKILL.md corpus, not a plugin)              #
+# --------------------------------------------------------------------------- #
+def _frontmatter(text: str) -> dict[str, str]:
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    out: dict[str, str] = {}
+    for line in text[3:end].splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def build_skill_index(skills_dir: Path) -> tuple[str, int]:
+    """Markdown index of every SKILL.md (name + 'Use when' description),
+    grouped transformation-skills vs. rule-skills. Returns (markdown, count)."""
+    rules: list[tuple[str, str]] = []
+    transforms: list[tuple[str, str]] = []
+    for skill_md in sorted(skills_dir.rglob("SKILL.md")):
+        fm = _frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
+        name = fm.get("name") or skill_md.parent.name
+        desc = fm.get("description", "").strip()
+        rel = skill_md.relative_to(skills_dir)
+        (transforms if rel.parts and rel.parts[0] == "transformations" else rules).append((name, desc))
+    lines: list[str] = []
+    if transforms:
+        lines.append("KLEE transformation skills (path-explosion / unsolvable-queries):")
+        lines += [f"  - {n}: {d}" for n, d in transforms]
+        lines.append("")
+    if rules:
+        lines.append("Source-rewriting rule skills:")
+        lines += [f"  - {n}: {d}" for n, d in rules]
+    return "\n".join(lines), len(rules) + len(transforms)
+
+
+# --------------------------------------------------------------------------- #
+# Build + KLEE (orchestrator-owned; the agent cannot invoke these)            #
+# --------------------------------------------------------------------------- #
+def build_bitcode(work_src: Path, artifact: str, out_bc: Path, log: Path) -> bool:
+    env = dict(os.environ, LLVM_COMPILER="clang", CC="gclang", CXX="gclang++",
+               CFLAGS=BITCODE_CFLAGS, CXXFLAGS=BITCODE_CFLAGS)
+    with log.open("w") as fh:
+        try:
+            if subprocess.run(["make"], cwd=work_src, env=env, stdout=fh,
+                              stderr=subprocess.STDOUT, timeout=1800).returncode != 0:
+                return False
+        except subprocess.TimeoutExpired:
+            fh.write("\nbuild: make timed out after 1800s\n")
+            return False
+        art = work_src / artifact
+        if not art.exists():
+            fh.write(f"\nbuild: artifact {artifact!r} not found\n")
+            return False
+        rc = subprocess.run(["get-bc", "-o", str(out_bc), str(art)],
+                            stdout=fh, stderr=subprocess.STDOUT).returncode
+    return rc == 0 and out_bc.exists() and out_bc.stat().st_size > 0
+
+
+def run_klee(bitcode: Path | None, out_dir: Path, args: argparse.Namespace) -> int:
+    cmd = [str(EVAL_KLEE), "--max-time", args.max_time_per_run,
+           "--cov-sample-every", "0", "--out", str(out_dir)]
+    if bitcode is not None:
+        cmd += ["--bitcode", str(bitcode)]
+    if args.search:
+        cmd += ["--search", args.search]
+    if args.max_memory:
+        cmd += ["--max-memory", args.max_memory]
+    return subprocess.run(cmd).returncode
+
+
+def lines_covered(round_dir: Path) -> int:
+    try:
+        data = json.loads((round_dir / "coverage" / "report.json").read_text())
+        return int(data["data"][0]["totals"]["lines"]["covered"])
+    except Exception:
+        return -1
+
+
+# --- digest the three artifacts into a text feedback file the agent reads --- #
+def _digest_coverage(report: Path, top_files: int = 25) -> str:
+    if not report.exists():
+        return "coverage report: not produced (no ktests replayed?)."
+    try:
+        d0 = json.loads(report.read_text())["data"][0]
+    except Exception as e:
+        return f"coverage report: unreadable ({e})."
+    t = d0.get("totals", {})
+
+    def m(name: str) -> str:
+        x = t.get(name, {})
+        c, n = x.get("covered", 0), x.get("count", 0)
+        return f"{c}/{n} ({100.0 * c / n:.1f}%)" if n else "0/0"
+
+    out = ["## coverage totals"]
+    out += [f"- {k}: {m(k)}" for k in ("lines", "regions", "branches", "functions")]
+    rows = []
+    for f in d0.get("files", []):
+        s = f.get("summary", {}).get("lines", {})
+        rows.append((Path(f.get("filename", "?")).name, s.get("covered", 0), s.get("count", 0)))
+    rows.sort(key=lambda r: (r[1] / r[2] if r[2] else 0.0, -r[2]))
+    out.append("\n## per-file lines (lowest first — 0% files are the leads)")
+    out += [f"- {c}/{n} ({100.0 * c / n if n else 0:.1f}%) {nm}" for nm, c, n in rows[:top_files]]
+    return "\n".join(out)
+
+
+def _digest_run_stats(stats: Path) -> str:
+    if not stats.exists():
+        return "run.stats: not produced."
+    cols = ["WallTime", "CoveredInstructions", "NumStates", "MallocUsage", "InhibitedForks",
+            "TerminationExit", "TerminationEarly", "TerminationUserError",
+            "TerminationProgramError", "TerminationExecutionError"]
+    try:
+        con = sqlite3.connect(f"file:{stats}?mode=ro", uri=True)
+        cur = con.execute("SELECT * FROM stats ORDER BY rowid DESC LIMIT 1")
+        row, names = cur.fetchone(), [d[0] for d in cur.description]
+        con.close()
+    except sqlite3.Error as e:
+        return f"run.stats: unreadable ({e})."
+    if not row:
+        return "run.stats: empty."
+    rec = dict(zip(names, row))
+    out = ["## run.stats (final row — fork-bound vs. solver-bound vs. stuck)"]
+    for k in cols:
+        if k in rec:
+            v = rec[k]
+            if k == "WallTime" and isinstance(v, (int, float)):
+                v = f"{float(v) / 1e6:.0f}s"
+            elif k == "MallocUsage" and isinstance(v, (int, float)):
+                v = f"{int(v) // 1024 // 1024} MB"
+            out.append(f"- {k} = {v}")
+    kt = sum(int(rec.get(k, 0) or 0) for k in
+             ("TerminationExit", "TerminationUserError", "TerminationProgramError"))
+    out.append(f"- ktest-emitting terminations (Exit+UserError+ProgramError) = {kt}")
+    return "\n".join(out)
+
+
+def _digest_istats(istats: Path, top_n: int = 15) -> str:
+    if not istats.exists():
+        return "run.istats: not produced."
+    events: list[str] = []
+    self_cost: dict[str, list[int]] = {}
+    fl = fn = ""
+    skip = False
+    try:
+        with istats.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("events:"):
+                    events = line.split()[1:]
+                elif line.startswith("fl="):
+                    fl = line[3:].strip()
+                elif line.startswith("fn="):
+                    fn, skip = line[3:].strip(), False
+                elif line.startswith("cfn=") or line.startswith("calls="):
+                    skip = True
+                elif line.startswith("cfl="):
+                    pass
+                elif line and line[0].isdigit():
+                    if skip:
+                        skip = False
+                        continue
+                    costs = line.split()[2:]
+                    if not events or len(costs) < len(events):
+                        continue
+                    acc = self_cost.setdefault(f"{fn}\t{fl}", [0] * len(events))
+                    for i in range(len(events)):
+                        try:
+                            acc[i] += int(costs[i])
+                        except ValueError:
+                            pass
+    except OSError as e:
+        return f"run.istats: unreadable ({e})."
+    if not events or not self_cost:
+        return "run.istats: no per-function costs parsed."
+    out = [f"## run.istats — per-function self cost (events: {', '.join(events)})"]
+    rank = [0] + ([events.index("Qtime")] if "Qtime" in events else [])
+    for col in rank:
+        ranked = sorted(self_cost.items(), key=lambda kv: kv[1][col], reverse=True)
+        total = sum(v[col] for v in self_cost.values()) or 1
+        out.append(f"\nTop functions by {events[col]}:")
+        for key, costs in ranked[:top_n]:
+            fnn, fln = key.split("\t", 1)
+            out.append(f"- {costs[col]} ({100.0 * costs[col] / total:.1f}%) {fnn} [{fln}]")
+    return "\n".join(out)
+
+
+def write_feedback(round_dir: Path, dest: Path, header: str) -> None:
+    klee_out = round_dir / "klee-out"
+    parts = [header, "",
+             _digest_coverage(round_dir / "coverage" / "report.json"), "",
+             _digest_run_stats(klee_out / "run.stats"), "",
+             _digest_istats(klee_out / "run.istats"), "",
+             "## raw artifacts (Read for deeper inspection)",
+             f"- coverage JSON: {round_dir / 'coverage' / 'report.json'}",
+             f"- run.istats:    {klee_out / 'run.istats'}"]
+    dest.write_text("\n".join(parts), encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Prompts                                                                     #
+# --------------------------------------------------------------------------- #
+def system_prompt(program: str, skills_dir: Path, skill_index: str) -> str:
+    return f"""\
+You are a KLEE symbolic-execution coverage agent. You raise the line coverage a
+single KLEE run achieves on the C program `{program}` by transforming its source
+(your cwd, {TARGET_DIR} — edit in place).
+
+The unit of measurement is ONE KLEE run on ONE bitcode build. Coverage is the
+lines-covered from that run's replayed ktests; a transformation only counts if
+it raises that number. Never reason about merging coverage across runs.
+
+You CANNOT run KLEE or build — the orchestrator does that between your turns and
+hands you a feedback file each round. Each turn:
+  1. Read the feedback file (path in the message): coverage totals, per-file
+     0% modules, the run.stats termination breakdown (fork-bound = TerminationEarly
+     dominates; solver-bound = high Qtime in run.istats), and the istats hotspots.
+     You may also Read the raw coverage JSON / run.istats it points at.
+  2. Pick a transformation skill whose trigger matches the obstacle. The skills
+     live under {skills_dir} (READ-ONLY). An index of every skill (name + 'Use
+     when') is below; Read the matching <name>/SKILL.md for its transformation
+     and before/after example before applying.
+  3. Apply it by editing the source (AT MOST {MAX_FILES} files this round — a
+     hook enforces it; pick the highest-value files where symbolic input flows).
+     Then end your turn so KLEE can run.
+
+Hard rules:
+  * {TARGET_DIR} is the ONLY place you may write. The skills dir is read-only.
+  * KLEE intrinsics (klee_assume, klee_range, klee_make_symbolic) are
+    bitcode-only — guard every one you add with `#ifdef KLEE_BITCODE` so the
+    native coverage oracle build is byte-for-byte unchanged.
+  * Apply a pattern only where its preconditions genuinely hold; a wrong
+    application silently destroys coverage. Name the skill at each edit.
+  * Say DONE when no skill can move a still-reachable 0% module.
+
+## Available skills
+{skill_index}
+"""
+
+
+def round_prompt(round_no: int, feedback_path: Path, prev_lines: int, best_lines: int,
+                 max_time: str) -> str:
+    return (f"Round {round_no}. The latest KLEE run ({max_time} budget) is digested in:\n"
+            f"  {feedback_path}\n"
+            f"Lines covered: {prev_lines} (best so far: {best_lines}).\n"
+            f"Read it, diagnose the dominant obstacle, consult the matching skill, and "
+            f"apply ONE transformation (<= {MAX_FILES} files). Then end your turn; I will "
+            f"rebuild and rerun KLEE and give you fresh traces.")
+
+
+# --------------------------------------------------------------------------- #
+# Agent round (persistent ClaudeSDKClient → context carries across rounds)    #
+# --------------------------------------------------------------------------- #
+def _fmt_tool_use(block: ToolUseBlock) -> str:
+    inp = block.input or {}
+    detail = next((f"{k}={inp[k]!r}" for k in PATH_KEYS if k in inp),
+                  ", ".join(f"{k}={v!r}" for k, v in list(inp.items())[:2]))
+    return f"  -> {block.name}({detail})"
+
+
+async def run_agent_turn(client: ClaudeSDKClient, prompt: str) -> tuple[str, dict]:
+    """Send one round's prompt; stream until the turn completes. Returns
+    (final_text, result_meta)."""
+    await client.query(prompt)
+    final_text = ""
+    meta: dict = {}
+    async for message in client.receive_response():
+        if isinstance(message, SystemMessage) and getattr(message, "subtype", None) == "init":
+            data = getattr(message, "data", {}) or {}
+            print(f"[init] session={data.get('session_id')}", file=sys.stderr)
+        elif isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock) and block.text.strip():
+                    print(block.text.strip(), file=sys.stderr)
+                    final_text += block.text
+                elif isinstance(block, ToolUseBlock):
+                    print(_fmt_tool_use(block), file=sys.stderr)
+        elif isinstance(message, UserMessage):
+            # tool_result blocks live here; surface sandbox denials/errors
+            content = message.content
+            if isinstance(content, list):
+                for b in content:
+                    if getattr(b, "is_error", False):
+                        print(f"  x denied/error: {getattr(b, 'content', '')}", file=sys.stderr)
+        elif isinstance(message, ResultMessage):
+            meta = {
+                "num_turns": message.num_turns,
+                "cost_usd": getattr(message, "total_cost_usd", None),
+                "usage": getattr(message, "usage", None) or {},
+                "permission_denials": getattr(message, "permission_denials", None) or [],
+                "is_error": message.is_error,
+                "result": getattr(message, "result", None),
+            }
+            if message.result:
+                final_text = message.result
+    return final_text, meta
+
+
+async def agent_loop(args: argparse.Namespace, program: str, work_src: Path,
+                     skills_dir: Path, skill_index: str, baseline_dir: Path,
+                     baseline_lines: int) -> dict:
+    feedback_path = Path(args.out).resolve() / "feedback-latest.md"
+
+    options = ClaudeAgentOptions(
+        cwd=str(work_src),
+        add_dirs=[str(skills_dir.resolve()), str(Path(args.out).resolve())],
+        disallowed_tools=["Bash", "WebFetch", "WebSearch", "Task"],
+        hooks={
+            "PreToolUse": [HookMatcher(matcher=None, hooks=[sandbox_hook])],
+            "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[release_slot_hook])],
+        },
+        permission_mode="bypassPermissions",
+        system_prompt={"type": "preset", "preset": "claude_code",
+                       "append": system_prompt(program, skills_dir, skill_index)},
+        model=args.model or None,
+        effort=args.effort,
+        max_turns=args.max_turns,
+    )
+
+    deadline = time.monotonic() + to_seconds(args.time_budget)
+    best_lines, best_round = baseline_lines, "000-baseline"
+    prev_lines = baseline_lines
+    rounds_run, done, total_cost = 0, False, 0.0
+
+    # First feedback: the baseline run.
+    write_feedback(baseline_dir, feedback_path, f"# Baseline (no transformation) — {program}")
+
+    async with ClaudeSDKClient(options=options) as client:
+        for rnd in range(1, args.max_rounds + 1):
+            if time.monotonic() >= deadline:
+                print("eval-symbolon: time budget exhausted", file=sys.stderr)
+                break
+            rid = f"{rnd:03d}"
+            round_dir = Path(args.out) / "rounds" / rid
+            round_dir.mkdir(parents=True, exist_ok=True)
+            reset_round()
+
+            print(f"\n=== round {rnd}: agent editing (<= {MAX_FILES} files) ===", file=sys.stderr)
+            text, meta = await run_agent_turn(
+                client, round_prompt(rnd, feedback_path, prev_lines, best_lines,
+                                      args.max_time_per_run))
+            (round_dir / "agent-rationale.md").write_text(text or "", encoding="utf-8")
+            if meta.get("cost_usd"):
+                total_cost += meta["cost_usd"]
+            if meta.get("is_error"):
+                print("eval-symbolon: agent turn errored; stopping", file=sys.stderr)
+                break
+            rounds_run = rnd
+
+            # Record the round's diff.
+            try:
+                with (round_dir / "diff.patch").open("w") as fh:
+                    subprocess.run(["diff", "-ruN", str(baseline_dir / "_nosrc"), str(work_src)],
+                                   stdout=fh, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+            # Build + run KLEE on the agent's edits.
+            out_bc = round_dir / "transformed.bc"
+            if not build_bitcode(work_src, program, out_bc, round_dir / "build.log"):
+                print(f"eval-symbolon: round {rnd} build FAILED", file=sys.stderr)
+                write_feedback(round_dir, feedback_path,
+                               f"# Round {rnd}: BUILD FAILED — fix the source.\n"
+                               f"See {round_dir / 'build.log'} (Read it).")
+                # feedback now points at the build error; keep prev coverage number.
+                (round_dir / "klee-out").mkdir(exist_ok=True)
+                continue
+
+            run_klee(out_bc, round_dir, args)
+            lines = lines_covered(round_dir)
+            print(f"eval-symbolon: round {rnd} lines-covered={lines} (best={best_lines})",
+                  file=sys.stderr)
+            if lines > best_lines:
+                best_lines, best_round = lines, rid
+                shutil.rmtree(Path(args.out) / "best", ignore_errors=True)
+                shutil.copytree(work_src, Path(args.out) / "best" / "src")
+
+            write_feedback(round_dir, feedback_path, f"# Round {rnd} result — {program}")
+            prev_lines = lines
+
+            if text and "DONE" in text:
+                print("eval-symbolon: agent reported DONE", file=sys.stderr)
+                done = True
+                break
+
+    return {"baseline": baseline_lines, "best": best_lines, "best_round": best_round,
+            "rounds": rounds_run, "done": done, "cost_usd": round(total_cost, 4)}
+
+
+# --------------------------------------------------------------------------- #
+# Duration                                                                    #
+# --------------------------------------------------------------------------- #
+def to_seconds(v: str) -> int:
+    v = v.strip()
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return int(float(v[:-1]) * mult[v[-1]]) if v and v[-1] in mult else int(float(v))
+
+
+# --------------------------------------------------------------------------- #
+# Dry-run self-test                                                           #
+# --------------------------------------------------------------------------- #
+def dry_run(skills_dir: Path) -> int:
+    print(f"Target (rw):   {TARGET_DIR}")
+    print(f"Read roots:    {', '.join(str(r) for r in READ_ROOTS)}")
+    print(f"Max files:     {MAX_FILES}")
+    skill_index, n = build_skill_index(skills_dir) if skills_dir.is_dir() else ("(skills dir missing)", 0)
+    print(f"Skills:        {n} loaded from {skills_dir}")
+
+    ok = True
+    print("\n--- sandbox gate self-test ---")
+    klee_out_root = READ_ROOTS[-1] if READ_ROOTS else TARGET_DIR
+    cases = [
+        ("Read", {"file_path": str(TARGET_DIR / "a.c")}, True),
+        ("Read", {"file_path": str(skills_dir / "scanf-to-getchar" / "SKILL.md")}, True),
+        ("Read", {"file_path": str(klee_out_root / "rounds" / "001" / "coverage" / "report.json")}, True),
+        ("Edit", {"file_path": str(TARGET_DIR / "a.c")}, True),
+        ("Write", {"file_path": str(skills_dir / "x.md")}, False),       # write to read-only
+        ("Read", {"file_path": "/etc/passwd"}, False),                    # outside
+        ("Read", {"file_path": str(TARGET_DIR / "../../../etc/passwd")}, False),  # traversal
+        ("Bash", {"command": "ls"}, False),                               # unknown tool
+        ("Grep", {"pattern": "klee", "path": str(TARGET_DIR)}, True),
+    ]
+    for name, inp, expect in cases:
+        allowed = _evaluate(name, inp) is None
+        flag = "ok" if allowed == expect else "FAIL"
+        ok = ok and allowed == expect
+        tgt = inp.get("file_path") or inp.get("path") or f"<{name}>"
+        print(f"  [{flag}] {'ALLOW' if allowed else 'DENY '} {name:6} {tgt}")
+
+    print(f"\n--- file-cap self-test (cap={MAX_FILES}) ---")
+    reset_round()
+    cap_cases = [(f"f{i}.c", True, None, "new within cap") for i in range(MAX_FILES)]
+    cap_cases += [("f0.c", True, "tid0", "re-edit opened file"),
+                  (f"f{MAX_FILES}.c", False, "tidN", "new beyond cap -> deny")]
+    for fname, expect, _tid, why in cap_cases:
+        inp = {"file_path": str(TARGET_DIR / fname)}
+        allowed = (_evaluate("Edit", inp) or _file_cap_reason("Edit", inp, fname)) is None
+        flag = "ok" if allowed == expect else "FAIL"
+        ok = ok and allowed == expect
+        print(f"  [{flag}] {'ALLOW' if allowed else 'DENY '} Edit {fname:8} ({why})")
+    # failed-edit-releases-slot: reserve a 1st-over-cap new file then release it
+    reset_round()
+    for i in range(MAX_FILES):
+        _file_cap_reason("Edit", {"file_path": str(TARGET_DIR / f"g{i}.c")}, f"t{i}")
+    over = _file_cap_reason("Edit", {"file_path": str(TARGET_DIR / "gX.c")}, "tX")
+    denied_at_cap = over is not None
+    # simulate g0's edit failing -> slot freed -> a new file now fits
+    asyncio.run(release_slot_hook({"tool_name": "Edit"}, "t0", None))
+    freed = _file_cap_reason("Edit", {"file_path": str(TARGET_DIR / "gY.c")}, "tY") is None
+    flag = "ok" if (denied_at_cap and freed) else "FAIL"
+    ok = ok and denied_at_cap and freed
+    print(f"  [{flag}] failed edit releases its slot (deny-at-cap={denied_at_cap}, freed-after-failure={freed})")
+    reset_round()
+
+    print("\n--- skill index preview (first 12 lines) ---")
+    print("\n".join(skill_index.splitlines()[:12]))
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
+# Main                                                                        #
+# --------------------------------------------------------------------------- #
+def main() -> int:
+    sys.stdout.reconfigure(line_buffering=True)
+    global MAX_FILES
+
+    ap = argparse.ArgumentParser(description="Claude Agent SDK KLEE coverage loop.")
+    ap.add_argument("--out", required=True, help="Output dir (rounds/, work/, best/, summary.json).")
+    ap.add_argument("--skills-dir", default=os.environ.get("SYMBOLON_SKILLS_DIR", "library"))
+    ap.add_argument("--max-rounds", type=int, default=20)
+    ap.add_argument("--max-time-per-run", default="3m", help="KLEE wall-clock per round.")
+    ap.add_argument("--time-budget", default="2h")
+    ap.add_argument("--search", default="nurs:covnew")
+    ap.add_argument("--max-memory", default="32768")
+    ap.add_argument("--max-files-per-round", type=int, default=3)
+    ap.add_argument("--model", default="claude-opus-4-8",
+                    help='Model id; pass "" to let the CLI pick (required on Bedrock/Vertex).')
+    ap.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
+    ap.add_argument("--max-turns", type=int, default=150, help="Max agent turns per round.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Offline: self-test the sandbox gate + skill index, no API call.")
+    args = ap.parse_args()
+    MAX_FILES = args.max_files_per_round
+
+    prog_dir = Path(os.environ.get("SYMBOLON_PROGRAM_DIR", "/opt/program"))
+    src_dir = prog_dir / "src"
+    program_json = prog_dir / "program.json"
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Resolve to absolute: the agent's cwd is the target tree, so a relative
+    # skills path ("library") would wrongly resolve under the target. Everything
+    # the agent sees (prompt, add_dirs, sandbox roots) must be absolute.
+    if not Path(args.skills_dir).is_dir():
+        print(f"eval-symbolon: skills dir {args.skills_dir} not found", file=sys.stderr)
+        return 2
+    skills_dir = Path(args.skills_dir).resolve()
+
+    program = "program"
+    if program_json.is_file():
+        try:
+            program = json.loads(program_json.read_text()).get("name", "program")
+        except ValueError:
+            pass
+
+    # Working tree the agent edits across rounds.
+    work_src = out / "work" / "src"
+
+    if args.dry_run:
+        sd = Path(args.skills_dir).resolve()
+        # Configure the sandbox against the (possibly not-yet-copied) work tree.
+        configure(work_src.resolve(), (work_src.resolve(), sd, out))
+        return dry_run(sd)
+
+    if not src_dir.is_dir():
+        print(f"eval-symbolon: {src_dir} missing", file=sys.stderr)
+        return 2
+    if not EVAL_KLEE.exists():
+        print(f"eval-symbolon: sibling eval-klee not found at {EVAL_KLEE}", file=sys.stderr)
+        return 2
+
+    if work_src.exists():
+        shutil.rmtree(work_src)
+    work_src.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src_dir, work_src)
+    configure(work_src, (work_src, skills_dir, out))
+
+    skill_index, n_skills = build_skill_index(skills_dir)
+    print(f"eval-symbolon: {n_skills} skills loaded from {skills_dir}", file=sys.stderr)
+
+    # Baseline run on the pristine bitcode.
+    baseline_dir = out / "rounds" / "000-baseline"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    baseline_bc = prog_dir / "program.bc"
+    print("eval-symbolon: baseline KLEE run...", file=sys.stderr)
+    run_klee(baseline_bc if baseline_bc.exists() else None, baseline_dir, args)
+    baseline_lines = lines_covered(baseline_dir)
+    print(f"eval-symbolon: baseline lines-covered={baseline_lines}", file=sys.stderr)
+
+    result = asyncio.run(agent_loop(args, program, work_src, skills_dir, skill_index,
+                                    baseline_dir, baseline_lines))
+
+    summary = {
+        "program": program, "model": args.model or "(cli default)",
+        "baseline-lines-covered": result["baseline"],
+        "best-lines-covered": result["best"],
+        "best-round": result["best_round"],
+        "rounds-run": result["rounds"],
+        "max-time-per-run": args.max_time_per_run, "search": args.search,
+        "done": result["done"], "cost-usd": result["cost_usd"],
+    }
+    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"\neval-symbolon: done; baseline={result['baseline']} best={result['best']} "
+          f"round={result['best_round']} cost=${result['cost_usd']} "
+          f"summary={out / 'summary.json'}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

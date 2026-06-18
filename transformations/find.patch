@@ -1,0 +1,104 @@
+--- a/find/ftsfind.c
++++ b/find/ftsfind.c
+@@ -57,6 +57,10 @@
+ #include "unused-result.h"
+ #include "system.h"
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++#endif
++
+ 
+ #undef  STAT_MOUNTPOINTS
+ 
+@@ -736,6 +740,90 @@
+   else
+     set_program_name ("find");
+ 
++#ifdef KLEE_BITCODE
++  /* find-arg-menu-pin (code-transformation round 1, ceiling mode).
++   *
++   * Obstacle (diagnosed from the baseline run): under the fixed symEnv
++   * (--sym-args 0 3 10) the symbolic argv almost never assembles a valid find
++   * predicate, so parser.c (172/1973), pred.c (53/829), print.c (0/910) and
++   * parse-datetime.c (0/1805) stay ~0% covered.  Meanwhile the unmatched
++   * symbolic option strings drive the parse-table strcmp scan and the
++   * error/usage path: quotearg_buffer_restyled forks 240k+ times (the single
++   * dominant fork sink, 5x the next), strcmp/memcmp another ~50k, and 66% of
++   * wall time is solver.  Path explosion on the argv lexical layer.
++   *
++   * Remedy (input-menu-pin; cf. bc unified-multipin, curl *-menu): pin argv to
++   * ONE OF A MENU of valid find expressions chosen by a symbolic klee_range.
++   * KLEE forks once on the selector and explores every entry in a single run;
++   * each branch constrains the symbolic argv bytes (so the emitted ktest
++   * replays that exact expression on the native coverage binary) and
++   * concretizes them (so the downstream parse + traversal is fork-free).
++   *
++   * READ-ONLY ONLY: ktests are replayed against the real native binary, so the
++   * menu excludes -delete / -exec / -execdir / -ok(dir) / -fprint* / -fls,
++   * which would mutate the filesystem or spawn processes at replay time.  Each
++   * arg is <= 9 chars (the 10-byte --sym-args slot holds keyword + NUL) and
++   * each entry uses <= 3 args (the --sym-args max).  Binary operators (-a/-o),
++   * the exec family, -fprintf and the bison date grammar (-newermt ...) need
++   * > 3 args or a sandbox and are recorded as next-round leads. */
++  {
++    static const char *const menu[][3] = {
++      {"-name", "*", 0},    {"-iname", "*", 0},
++      {"-path", "*", 0},    {"-ipath", "*", 0},
++      {"-regex", ".*", 0},  {"-iregex", ".*", 0},
++      {"-lname", "*", 0},   {"-ilname", "*", 0},
++      {"-type", "f", 0},    {"-xtype", "l", 0},
++      {"-size", "1", 0},    {"-empty", 0, 0},
++      {"-perm", "644", 0},
++      {"-newer", "A", 0},   {"-anewer", "A", 0},  {"-cnewer", "A", 0},
++      {"-mtime", "0", 0},   {"-atime", "0", 0},   {"-ctime", "0", 0},
++      {"-mmin", "0", 0},    {"-amin", "0", 0},    {"-cmin", "0", 0},
++      {"-used", "1", 0},
++      {"-user", "0", 0},    {"-uid", "0", 0},
++      {"-group", "0", 0},   {"-gid", "0", 0},
++      {"-nouser", 0, 0},    {"-nogroup", 0, 0},
++      {"-links", "1", 0},   {"-inum", "1", 0},
++      {"-samefile", "A", 0}, {"-fstype", "ext2", 0},
++      {"-readable", 0, 0},  {"-writable", 0, 0},
++      {"-true", 0, 0},      {"-false", 0, 0},
++      {"-print", 0, 0},     {"-print0", 0, 0},
++      {"-printf", "%p", 0}, {"-printf", "%y%i%s", 0},
++      {"-ls", 0, 0},        {"-prune", 0, 0},     {"-quit", 0, 0},
++      {"-depth", 0, 0},     {"-follow", 0, 0},    {"-daystart", 0, 0},
++      {"-xdev", 0, 0},      {"-mount", 0, 0},     {"-noleaf", 0, 0},
++      {"-warn", 0, 0},      {"-nowarn", 0, 0},
++      {"-maxdepth", "1", 0}, {"-mindepth", "0", 0},
++      {"-not", "-empty", 0},
++      {"(", "-print", ")"},
++    };
++    enum { NMENU = sizeof (menu) / sizeof (menu[0]) };
++    unsigned sel = (unsigned) klee_range (0, NMENU, "find_arg_menu");
++    const char *const *entry = menu[0];
++    unsigned k;
++    int a, i, nargs;
++    for (k = 1; k < (unsigned) NMENU; k++)
++      if (sel == k)
++        entry = menu[k];
++    nargs = 0;
++    while (nargs < 3 && entry[nargs] != 0)
++      nargs++;
++    /* Select the symbolic-argv state with exactly this arity; states with a
++     * different argc die here (benign provably-false, dedup'd by KLEE). */
++    klee_assume (argc == nargs + 1);
++    for (a = 0; a < nargs; a++)
++      {
++        const char *s = entry[a];
++        for (i = 0; s[i]; i++)
++          {
++            klee_assume (argv[a + 1][i] == s[i]);
++            argv[a + 1][i] = s[i];
++          }
++        klee_assume (argv[a + 1][i] == '\0');
++        argv[a + 1][i] = '\0';
++      }
++  }
++#endif
++
+   record_initial_cwd ();
+ 
+   state.already_issued_stat_error_msg = false;

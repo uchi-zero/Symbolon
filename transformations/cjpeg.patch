@@ -1,0 +1,82 @@
+--- a/src/cjpeg.c	2026-06-06 15:30:44.343004226 +0000
++++ b/src/cjpeg.c	2026-06-06 15:31:34.314773259 +0000
+@@ -41,6 +41,10 @@
+ #include "jversion.h"           /* for version message */
+ #include "jconfigint.h"
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>          /* klee_assume for the input-format-dispatch pin */
++#endif
++
+ 
+ /* Create the add-on message string table. */
+ 
+@@ -99,6 +103,23 @@
+   if (ungetc(c, infile) == EOF)
+     ERREXIT(cinfo, JERR_UNGETC_FAILED);
+ 
++#ifdef KLEE_BITCODE
++  /* Input-format-dispatch pin (path-explosion remedy) — see
++   * transformations/README.md (round 3). The symbolic input file's first byte
++   * dispatches to four readers; the BMP/GIF/Targa readers are deep symbolic-
++   * length / LZW gauntlets (round-2 leaf attribution: nurs:md2u burned 628k
++   * forks in memcpy + 331k in start_input_gif and never reached the backend).
++   * Pin the dispatch to PPM ('P') so EVERY searcher follows the one path that
++   * the valid-image pin (rdppm.c) drives deterministically into the JPEG
++   * compression backend, instead of some searchers wandering into a reader
++   * fork-bomb. The byte is re-read (and re-checked) by start_input_ppm, so the
++   * constraint propagates; replay-faithful because the emitted ktest's first
++   * byte is literally 'P'. Trade-off: the BMP/GIF/Targa readers go uncovered
++   * (a reachable-but-blocked residual), accepted to get all four searchers into
++   * the backend — see the round-3 verdict in the README. */
++  klee_assume(c == 'P');
++#endif
++
+   switch (c) {
+ #ifdef BMP_SUPPORTED
+   case 'B':
+--- a/src/rdppm.c	2026-06-06 15:30:44.350004194 +0000
++++ b/src/rdppm.c	2026-06-06 15:31:07.864895510 +0000
+@@ -25,6 +25,10 @@
+ #include "cmyk.h"
+ #include "cdjpeg.h"             /* Common decls for cjpeg/djpeg applications */
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>          /* klee_assume for the PPM valid-image pin */
++#endif
++
+ #if defined(PPM_SUPPORTED) && \
+     (BITS_IN_JSAMPLE != 16 || defined(C_LOSSLESS_SUPPORTED))
+ 
+@@ -711,6 +715,23 @@
+ 
+   c = getc(source->pub.input_file); /* subformat discriminator character */
+ 
++#ifdef KLEE_BITCODE
++  /* PPM valid-image pin (path-explosion remedy) — see transformations/README.md
++   * (round 2). Drive a known-valid 1x1 raw-RGB PPM (P6 1 1 9\n) so KLEE reaches
++   * the JPEG compression backend on one deterministic, fork-free path; the 3
++   * pixel bytes + option args stay symbolic. Replay-faithful: we klee_assume the
++   * ACTUAL file bytes the original parser reads, so an emitted ktest is a literal
++   * "P6 1 1 9\n..." that the concrete oracle parses identically. */
++  klee_assume(c == '6');
++  {
++    static const char hdr[6] = { '1', ' ', '1', ' ', '9', '\n' };
++    int i;
++    for (i = 0; i < 6; i++)
++      klee_assume((unsigned char)getc(source->pub.input_file) ==
++                  (unsigned char)hdr[i]);
++    w = 1; h = 1; maxval = 9;
++  }
++#else
+   /* detect unsupported variants (ie, PBM) before trying to read header */
+   switch (c) {
+   case '2':                     /* it's a text-format PGM file */
+@@ -727,6 +748,7 @@
+   w = read_pbm_integer(cinfo, source->pub.input_file, 65535);
+   h = read_pbm_integer(cinfo, source->pub.input_file, 65535);
+   maxval = read_pbm_integer(cinfo, source->pub.input_file, 65535);
++#endif
+ 
+   if (w <= 0 || h <= 0 || maxval <= 0) /* error check */
+     ERREXIT(cinfo, JERR_PPM_NOT);

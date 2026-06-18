@@ -1,0 +1,78 @@
+{
+  "files": {
+    "switch.c": {
+      "functions": {
+        "route": {
+          "lines": {
+            "11": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "load"
+              ]
+            },
+            "3": {
+              "categories": [
+                "MemOp",
+                "Switch"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "load",
+                "switch"
+              ]
+            },
+            "5": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            },
+            "7": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            },
+            "9": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "switch.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 0,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 5,
+      "Realloc": 0,
+      "Switch": 1
+    },
+    "total_findings": 5,
+    "unlocated_by_category": {
+      "MemOp": 1
+    }
+  }
+}

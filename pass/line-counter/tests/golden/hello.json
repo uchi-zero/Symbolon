@@ -1,0 +1,28 @@
+{
+  "files": {
+    "hello.c": {
+      "line_count": 13,
+      "lines": [
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        12,
+        14,
+        15,
+        16,
+        18,
+        19,
+        20
+      ]
+    }
+  },
+  "module": "hello.bc",
+  "schema_version": 1,
+  "summary": {
+    "total_files": 1,
+    "total_lines": 13
+  }
+}

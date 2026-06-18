@@ -1,0 +1,22 @@
+{
+  "files": {
+    "system_path_default.c": {
+      "branch_count": 1,
+      "branches": [
+        {
+          "line": 11,
+          "opcode": "br",
+          "outcomes": 2
+        }
+      ],
+      "outcome_count": 2
+    }
+  },
+  "module": "system_path_default.bc",
+  "schema_version": 1,
+  "summary": {
+    "total_branches": 1,
+    "total_files": 1,
+    "total_outcomes": 2
+  }
+}

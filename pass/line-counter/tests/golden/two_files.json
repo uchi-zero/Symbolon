@@ -1,0 +1,27 @@
+{
+  "files": {
+    "two_files.c": {
+      "line_count": 5,
+      "lines": [
+        6,
+        7,
+        8,
+        10,
+        11
+      ]
+    },
+    "two_files_helper.c": {
+      "line_count": 2,
+      "lines": [
+        5,
+        6
+      ]
+    }
+  },
+  "module": "two_files.bc",
+  "schema_version": 1,
+  "summary": {
+    "total_files": 2,
+    "total_lines": 7
+  }
+}

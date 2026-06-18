@@ -1,0 +1,97 @@
+{
+  "files": {
+    "indirectbr.c": {
+      "functions": {
+        "dispatch": {
+          "lines": {
+            "10": {
+              "categories": [
+                "Conditional",
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "br",
+                "load"
+              ]
+            },
+            "11": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            },
+            "12": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "load"
+              ]
+            },
+            "14": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            },
+            "16": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            },
+            "18": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "store"
+              ]
+            },
+            "19": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "load"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "indirectbr.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 1,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 7,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 7,
+    "unlocated_by_category": {
+      "Indirect": 1,
+      "MemOp": 1
+    }
+  }
+}

@@ -1,0 +1,15 @@
+--- a/src/flvmeta.c
++++ b/src/flvmeta.c
+@@ -382,8 +382,11 @@
+      * padding. Concrete replay of this shape covers 1610 lines, including the
+      * 0%-covered libyaml emitter/API modules. */
+     if (argc != 4 ||
+         strcmp(argv[1], "-F") != 0 ||
+-        strcmp(argv[2], "-y") != 0 ||
++        (strcmp(argv[2], "-y") != 0 &&
++         strcmp(argv[2], "-j") != 0 &&
++         strcmp(argv[2], "-x") != 0 &&
++         strcmp(argv[2], "-r") != 0) ||
+         strcmp(argv[3], "A") != 0) {
+         return ERROR_NO_FLV;
+     }

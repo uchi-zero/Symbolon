@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# klee-plateau-watch — watch a running KLEE process; stop it when coverage has
+# plateaued, or when a hard time ceiling is reached.
+#
+# Plateau verdict (conservative, two-signal), over a trailing window W:
+#   (no new *.ktest for W)  AND  (CoveredInstructions flat for W),
+# first eligible once W has elapsed. ktest-idle is the necessary condition
+# (reported coverage is reconstructed only from ktests); CoveredInstructions-flat
+# is a keep-going guard that can only ever DELAY the stop, never trigger it early.
+#
+# On stop, sends SIGINT to --pid (escalating to SIGKILL after --grace) and writes
+# the reason (plateau|ceiling|exited) to --reason-file. If --pid exits on its own
+# first, writes "exited" and returns without signaling.
+#
+# Note: plateau and ceiling are checked once per --poll, so a stop can lag the
+# exact condition by up to one --poll interval.
+
+# @option --klee-out!      KLEE --output-dir (live *.ktest files + run.stats).
+# @option --pid!           PID of the klee worker to signal on stop.
+# @option --window=10m     Plateau window W (Ns/Nm/Nh).
+# @option --poll=60s       Poll cadence (Ns/Nm/Nh).
+# @option --ceiling=0      Hard wall-clock ceiling (Ns/Nm/Nh/Nd; 0 = none).
+# @option --grace=10s      Wait after SIGINT before SIGKILL (Ns/Nm/Nh).
+# @option --reason-file!   File to receive the stop reason.
+
+set -euo pipefail
+eval "$(argc --argc-eval "$0" "$@")"
+
+to_seconds() {
+  local v="$1"
+  case "$v" in
+    *s) echo "${v%s}" ;;
+    *m) echo $(( ${v%m} * 60 )) ;;
+    *h) echo $(( ${v%h} * 3600 )) ;;
+    *d) echo $(( ${v%d} * 86400 )) ;;
+    *)  echo "$v" ;;
+  esac
+}
+
+klee_out="$argc_klee_out"
+pid="$argc_pid"
+window=$(to_seconds "$argc_window")
+poll=$(to_seconds "$argc_poll")
+ceiling=$(to_seconds "$argc_ceiling")
+grace=$(to_seconds "$argc_grace")
+reason_file="$argc_reason_file"
+
+ktest_count() {                  # echoes a count, or 0 before klee-out exists
+  # klee-out may not exist yet for the first few polls: KLEE creates it only
+  # after loading the bitcode, which for a large module (e.g. vim's ~9 MB .bc)
+  # lags the watcher's first tick. Without this guard, `find` on the missing
+  # dir exits 1 and `set -o pipefail` kills the watcher before its loop starts.
+  [[ -d "$klee_out" ]] || { echo 0; return; }
+  find "$klee_out" -maxdepth 1 -name '*.ktest' 2>/dev/null | wc -l
+}
+
+covered_instructions() {         # echoes a count, or -1 when unreadable this tick
+  local rs="$klee_out/run.stats" v
+  if [[ ! -s "$rs" ]]; then echo -1; return; fi
+  v=$(sqlite3 "$rs" \
+    "SELECT CoveredInstructions FROM stats ORDER BY rowid DESC LIMIT 1;" 2>/dev/null || true)
+  if [[ "$v" =~ ^[0-9]+$ ]]; then echo "$v"; else echo -1; fi
+}
+
+now() { date +%s; }
+write_reason() { printf '%s\n' "$1" > "$reason_file"; }
+
+stop_klee() {
+  kill -INT "$pid" 2>/dev/null || true
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null && (( waited < grace )); do
+    sleep 1; waited=$(( waited + 1 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+}
+
+start=$(now)
+last_ktest=$(ktest_count)
+last_ci=$(covered_instructions)
+t_ktest_change=$start
+t_ci_change=$start
+
+while true; do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    write_reason exited
+    exit 0
+  fi
+
+  sleep "$poll"
+
+  tnow=$(now)
+  elapsed=$(( tnow - start ))
+
+  if (( ceiling > 0 )) && (( elapsed >= ceiling )); then
+    write_reason ceiling
+    stop_klee
+    exit 0
+  fi
+
+  kc=$(ktest_count)
+  ci=$(covered_instructions)
+  if (( kc > last_ktest )); then last_ktest=$kc; t_ktest_change=$tnow; fi
+  if (( ci >= 0 )) && (( ci > last_ci )); then last_ci=$ci; t_ci_change=$tnow; fi
+
+  ktest_idle=$(( tnow - t_ktest_change ))
+  ci_idle=$(( tnow - t_ci_change ))
+  if (( elapsed >= window )) && (( ktest_idle >= window )) && (( ci_idle >= window )); then
+    write_reason plateau
+    stop_klee
+    exit 0
+  fi
+done

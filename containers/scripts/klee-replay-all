@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# klee-replay-all — replay every ktest against an instrumented binary,
+# write a unique profraw per ktest, log structured results.
+
+# @option --binary!         Path to instrumented binary (coverage oracle).
+# @option --klee-out!       KLEE --output-dir whose *.ktest files to replay.
+# @option --profraw-dir!    Directory to receive one profraw per ktest.
+# @option --replays-jsonl!  Path to write per-ktest replay records (jsonl).
+# @option --timeout=30s     Per-ktest replay timeout (e.g. 30s, 2m).
+
+set -euo pipefail
+eval "$(argc --argc-eval "$0" "$@")"
+
+binary="$argc_binary"
+klee_out="$argc_klee_out"
+profraw_dir="$argc_profraw_dir"
+replays_jsonl="$argc_replays_jsonl"
+timeout_dur="$argc_timeout"
+
+mkdir -p "$profraw_dir"
+: > "$replays_jsonl"
+
+i=0
+for ktest in "$klee_out"/*.ktest; do
+  [[ -e "$ktest" ]] || continue
+  name="$(basename "$ktest" .ktest)"
+  profraw="$profraw_dir/${name}.profraw"
+
+  # KLEE_REPLAY_TIMEOUT bounds the replayed program; outer `timeout` bounds
+  # klee-replay itself (e.g., if it hangs feeding stdin).
+  set +e
+  out="$(KLEE_REPLAY_TIMEOUT=10 LLVM_PROFILE_FILE="$profraw" \
+    timeout --kill-after=5s "$timeout_dur" \
+    klee-replay "$binary" "$ktest" 2>&1)"
+  exit_code=$?
+  set -e
+
+  # JSON-escape the captured output (truncate to keep jsonl line lengths sane)
+  escaped="$(printf '%s' "${out:0:2000}" | jq -Rs .)"
+
+  printf '{"ktest":"%s","exit":%d,"profraw":"%s","stdout_stderr":%s}\n' \
+    "$name" "$exit_code" "$profraw" "$escaped" \
+    >> "$replays_jsonl"
+
+  i=$((i+1))
+done
+
+echo "klee-replay-all: replayed $i ktest(s)" >&2

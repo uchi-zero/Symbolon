@@ -1,0 +1,22 @@
+{
+  "files": {},
+  "module": "indirect_branch.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "IndirectBranch": 0
+    },
+    "by_severity": {
+      "conditional": 0,
+      "definite": 0,
+      "likely": 0
+    },
+    "total_findings": 0,
+    "unlocated_by_category": {
+      "IndirectBranch": 1
+    },
+    "unlocated_by_severity": {
+      "conditional": 1
+    }
+  }
+}

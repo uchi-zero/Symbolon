@@ -1,0 +1,39 @@
+{
+  "files": {
+    "klee_report_error.c": {
+      "functions": {
+        "main": {
+          "lines": {
+            "5": {
+              "callees": [
+                "klee_report_error"
+              ],
+              "categories": [
+                "ProgramTerminator"
+              ],
+              "opcodes": [
+                "call"
+              ],
+              "severities": [
+                "definite"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "klee_report_error.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "ProgramTerminator": 1
+    },
+    "by_severity": {
+      "conditional": 0,
+      "definite": 1,
+      "likely": 0
+    },
+    "total_findings": 1
+  }
+}

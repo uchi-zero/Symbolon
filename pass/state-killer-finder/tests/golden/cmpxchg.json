@@ -1,0 +1,37 @@
+{
+  "files": {
+    "cmpxchg.c": {
+      "functions": {
+        "main": {
+          "lines": {
+            "4": {
+              "callees": [],
+              "categories": [
+                "UnsupportedInstruction"
+              ],
+              "opcodes": [
+                "cmpxchg"
+              ],
+              "severities": [
+                "definite"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "cmpxchg.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "UnsupportedInstruction": 1
+    },
+    "by_severity": {
+      "conditional": 0,
+      "definite": 1,
+      "likely": 0
+    },
+    "total_findings": 1
+  }
+}

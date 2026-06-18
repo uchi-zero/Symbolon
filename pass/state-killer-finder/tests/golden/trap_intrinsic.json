@@ -1,0 +1,39 @@
+{
+  "files": {
+    "trap_intrinsic.c": {
+      "functions": {
+        "main": {
+          "lines": {
+            "3": {
+              "callees": [
+                "llvm.trap"
+              ],
+              "categories": [
+                "ProgramTerminator"
+              ],
+              "opcodes": [
+                "call"
+              ],
+              "severities": [
+                "definite"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "trap_intrinsic.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "ProgramTerminator": 1
+    },
+    "by_severity": {
+      "conditional": 0,
+      "definite": 1,
+      "likely": 0
+    },
+    "total_findings": 1
+  }
+}

@@ -1,0 +1,239 @@
+--- a/sed/sed.c	2026-06-07 21:02:32.109636253 +0000
++++ b/sed/sed.c	2026-06-07 21:03:16.943002545 +0000
+@@ -186,6 +186,130 @@
+   exit (status);
+ }
+ 
++#ifdef KLEE_BITCODE
++/* input-menu-pin (transformations/path-explosion/input-menu-pin), applied to
++   sed's *script* argument argv[1] (the harness makes it symbolic via
++   `--sym-arg 10`).  A single symbolic klee_range selects one of a menu of
++   complete, valid, terminating sed scripts; KLEE forks once and explores EVERY
++   script in ONE run.  Each branch klee_assumes the script bytes (so the ktest
++   replays that exact argv on the native cov binary) and concretizes them.
++   Paired with the fork-free input read in utils.c's ck_getdelim.
++
++   r5: SAME 74-script menu as r3 (r4 proved that *adding* entries dilutes and
++   regresses -- menu is saturated).  The new lever is PER-ENTRY INPUT: a parallel
++   sed_klee_inputs[] gives each script its own concrete input template, chosen to
++   drive that script's specific match / cycle branches (digits for [0-9], `abc`
++   for [a-c], four short lines for the line-address commands `2,3d` / `0~2d` /
++   `N;P` / `D`, repeats for backrefs, ...).  r3's single shared template
++   "aa.A1\nbbc" drove only a limited set of regexec.c DFA transitions
++   (build_trtable / check_node_accept_bytes / get_subexp are runtime,
++   input-byte-driven); tailoring the input per script reaches more WITHOUT
++   widening the menu.  sed.c publishes the selected input template via the extern
++   `sed_klee_input_tmpl`; utils.c's fork-free reader pins the input to it.
++   Guarded by KLEE_BITCODE so the cov binary never sees the intrinsics. */
++#include <klee/klee.h>
++static const char *const sed_klee_scripts[] = {
++  /* substitutions + flags */
++  "s/a/b/",    "s/a/b/g",   "s/a/b/p",   "s/a/b/2",   "s/a/b/i",
++  "s/./X/g",   "s/a*/X/g",  "s/^/>/",    "s/$/</",    "s/.*/Y/",
++  "s/[a]/Z/",  "s/[^a]/Q/", "s/a.c/X/",  "s/a\\|b/X/", "s/a\\+/b/",
++  "s/a\\?/b/", "s/a/&/",    "s/a/\\n/",  "/[a-c]\\+/d", "/[^a-c]/d",
++  /* addresses + commands */
++  "/a/d",      "/a/p",      "/^a/d",     "/a$/d",     "/a.*c/d",
++  "/a.b/d",    "/aa*bb*/d", "/a\\{2\\}/d", "/a\\|b/d",  "/\\(a\\)\\1/d",
++  "/a/!d",     "\\%a%d",    "1d",        "2,3d",      "$d",
++  "1!p",       "0~2d",      "1~2p",      "2q",        "3Q",
++  "1,2p",      "G",         "H;x",       "h;g",       "n;p",
++  "N;P",       "x;p",       "z;p",       "=",         "l",
++  "p",         "P",         "D",         "aX",        "iX",
++  "cX",        "y/ab/AB/",  "q",         "Q",         "F",
++  /* regex variety: backref sift, intervals, classes, word-boundary */
++  "/\\(.\\)\\1/p",  "s/[a-c]/X/", "s/[0-9]/#/", "/[0-9]/d",  "/a\\{2\\}/p",
++  "/\\<a/d",        "s/\\<a/^/g", "/[a-c]*x/d", "s/b\\+/F/g", "s/c*c/O/",
++  "/[0-9]\\+/d",    "s/aa/W/g",
++  /* hold-space copy/append handlers (line_copy / line_append) */
++  "H;G",            "x;G"
++};
++/* Per-entry input template (parallel to sed_klee_scripts, <= 8 bytes each --
++   the --sym-files / --sym-stdin width).  A '\n' splits lines; the FOUR-short-line
++   inputs ("1\n2\n3\n4") exercise the line-address / multi-cycle commands. */
++static const char *const sed_klee_inputs[] = {
++  /* substitutions + flags: input contains 'a' (+ a 2nd line for /g, p, etc.) */
++  "aab\nca",   "aaa\naa",   "aa\nbb",    "aa\naa",    "AaA\na",
++  "abc\n.x",   "aaa\nbb",   "ab\ncd",    "ab\ncd",    "abc\nde",
++  "aaa\nbb",   "abc\nde",   "abc\nab",   "ab\nba",    "aaaa\na",
++  "a\nbb",     "aa\nbb",    "aaa\nbb",   "abc\nca",   "a.1\nxy",
++  /* addresses + commands */
++  "ab\ncd",    "ab\ncd",    "ab\nca",    "ba\nca",    "axxc\nb",
++  "abc\nab",   "aabb\nc",   "aaa\nbb",   "ab\nba",    "aa\nbb",
++  "ab\ncd",    "ab\ncd",    "1\n2\n3\n4", "1\n2\n3\n4", "1\n2\n3\n4",
++  "1\n2\n3\n4", "1\n2\n3\n4", "1\n2\n3\n4", "1\n2\n3", "1\n2\n3\n4",
++  "1\n2\n3\n4", "ab\ncd",   "ab\ncd",    "ab\ncd",    "ab\ncd",
++  "ab\ncd",    "ab\ncd",    "ab\ncd",    "ab\ncd",    "a\tb\nc",
++  "ab\ncd",    "ab\ncd",    "ab\ncd",    "ab\ncd",    "ab\ncd",
++  "ab\ncd",    "abab\nc",   "ab\ncd",    "ab\ncd",    "ab\ncd",
++  /* regex variety */
++  "aa\nbb",    "abc\nde",   "a1b2\nc",   "a1\n2b",    "aa\nbb",
++  "a b\nc",    "a b\nc",    "abcx\nd",   "abbb\nc",   "ccc\na",
++  "a12\n34",   "aaa\nbb",
++  /* hold-space */
++  "a\nb\nc",   "a\nb\nc"
++};
++enum { SED_KLEE_NSCRIPTS
++       = sizeof (sed_klee_scripts) / sizeof (sed_klee_scripts[0]) };
++
++/* Published to utils.c's fork-free reader: the input template for the script
++   pinned this run, copied BYTE-BY-BYTE into a concrete buffer (not just a
++   pointer).  The reader's klee_assume needs each template byte to be a concrete
++   value so the constraint actually pins the symbolic input object in the ktest
++   (a plain `const char *` set from sed_klee_inputs[sel] left the deref
++   non-concrete, so A_data stayed unconstrained / replayed as zeros).  A fixed
++   16-byte buffer + length, filled with concrete chars in the selected fork. */
++char sed_klee_input_buf[16] = {0};
++int  sed_klee_input_len = 0;
++
++/* Pin argv[1] (a `--sym-arg 10` buffer: up to 10 symbolic bytes, NUL-terminated
++   at a symbolic position) to one menu entry, and publish that entry's input
++   template. */
++static void
++sed_klee_pin_script (int argc, char **argv)
++{
++  unsigned sel;
++  const char *p;
++  const char *in;
++  unsigned k;
++  int i;
++
++  if (argc < 2 || argv[1] == NULL)
++    return;
++
++  sel = (unsigned) klee_range (0, SED_KLEE_NSCRIPTS, "sed_script_sel");
++  p = sed_klee_scripts[0];
++  in = sed_klee_inputs[0];
++  for (k = 1; k < (unsigned) SED_KLEE_NSCRIPTS; k++)
++    if (sel == k)
++      {
++        p = sed_klee_scripts[k];
++        in = sed_klee_inputs[k];
++      }
++  /* Copy the selected input template into the concrete buffer the reader uses.
++     `in[i]` is a concrete char in this forked state, so each store lands a
++     concrete byte -- which lets utils.c's klee_assume actually pin A_data. */
++  for (i = 0; in[i] != '\0' && i < (int) sizeof (sed_klee_input_buf) - 1; i++)
++    sed_klee_input_buf[i] = in[i];
++  sed_klee_input_buf[i] = '\0';
++  sed_klee_input_len = i;
++
++  for (i = 0; p[i] != '\0'; i++)
++    {
++      klee_assume (argv[1][i] == p[i]);
++      argv[1][i] = p[i];
++    }
++  klee_assume (argv[1][i] == '\0');
++  argv[1][i] = '\0';
++}
++#endif /* KLEE_BITCODE */
++
+ int
+ main (int argc, char **argv)
+ {
+@@ -225,6 +349,12 @@
+ 
+   set_program_name (argv[0]);
+   initialize_main (&argc, &argv);
++#ifdef KLEE_BITCODE
++  /* input-menu-pin: collapse the symbolic 10-byte script (argv[1]) onto a menu
++     of valid scripts and publish its per-entry input template (utils.c reads
++     it) before getopt_long sees argv. */
++  sed_klee_pin_script (argc, argv);
++#endif
+ #if HAVE_SETLOCALE
+   /* Set locale according to user's wishes.  */
+   setlocale (LC_ALL, "");
+--- a/sed/utils.c	2026-06-07 21:02:32.109636253 +0000
++++ b/sed/utils.c	2026-06-07 21:02:32.116636310 +0000
+@@ -247,13 +247,90 @@
+   return nmemb;
+ }
+ 
++#ifdef KLEE_BITCODE
++#include <klee/klee.h>
++/* input-menu-pin companion (see sed.c).  libc getdelim scans the symbolic input
++   for the delimiter and forks on every possible newline position -- the dominant
++   fork site (66k self-forks, r2 profiling).  Replace it with a fork-free reader
++   under KLEE: pull raw bytes with getc (the file size is concrete under
++   --sym-files, so EOF does not fork) and pin each symbolic byte to a fixed
++   template, by absolute offset so an embedded delimiter cleanly splits lines.
++   The delimiter test is concrete every byte and never forks; klee_assume records
++   the bytes on the symbolic object (the cov binary replays the same input).
++
++   r5: the template is PER-SCRIPT -- sed.c fills the concrete buffer
++   `sed_klee_input_buf` (length `sed_klee_input_len`) for the menu entry pinned
++   this run, so each script sees input crafted to drive its own match / cycle
++   branches (digits for [0-9], four short lines for line-address commands, ...),
++   reaching more regexec.c DFA transitions without widening the menu.  The buffer
++   holds CONCRETE bytes (copied byte-by-byte in the selected fork) so the
++   klee_assume below actually pins the symbolic input object.  Falls back to a
++   default if the buffer is empty (a read before main's pin). */
++extern char sed_klee_input_buf[16];
++extern int  sed_klee_input_len;
++static size_t sed_klee_off = 0;
++static ssize_t
++sed_klee_getline (char **text, size_t *buflen, char delim, FILE *stream)
++{
++  static const char dflt[] = "aa.A1\nbbc";
++  const char *tmpl;
++  size_t tlen;
++  ssize_t n = 0;
++  int raw;
++
++  if (sed_klee_input_len > 0)
++    {
++      tmpl = sed_klee_input_buf;
++      tlen = (size_t) sed_klee_input_len;
++    }
++  else
++    {
++      tmpl = dflt;
++      tlen = sizeof (dflt) - 1;
++    }
++
++  if (*text == NULL || *buflen == 0)
++    {
++      *buflen = 128;
++      *text = xmalloc (*buflen);
++    }
++
++  while ((raw = getc (stream)) != EOF)
++    {
++      char c = tmpl[sed_klee_off++ % tlen];
++      /* Pin this input byte to the template before anything inspects it: the
++         assume constrains the symbolic object (so the ktest replays these exact
++         bytes), and the concrete c kept in the buffer means the delimiter test
++         below is concrete and never forks. */
++      klee_assume ((char) raw == c);
++      if ((size_t) n + 2 > *buflen)
++        {
++          *buflen *= 2;
++          *text = xrealloc (*text, *buflen);
++        }
++      (*text)[n++] = c;
++      if (c == delim)
++        break;
++    }
++
++  if (n == 0)
++    return -1;                 /* EOF with nothing read */
++  (*text)[n] = '\0';
++  return n;
++}
++#endif
++
+ ssize_t
+ ck_getdelim (char **text, size_t *buflen, char delim, FILE *stream)
+ {
+   if (ferror (stream))
+     panic (_("read error on %s"), utils_fp_name (stream));
+ 
++#ifdef KLEE_BITCODE
++  ssize_t result = sed_klee_getline (text, buflen, delim, stream);
++#else
+   ssize_t result = getdelim (text, buflen, delim, stream);
++#endif
+   if (ferror (stream)) /* implies result < 0, hence errno is set */
+     panic (_("read error on %s: %s"), utils_fp_name (stream), strerror (errno));
+ 

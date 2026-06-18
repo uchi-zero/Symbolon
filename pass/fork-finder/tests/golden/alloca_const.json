@@ -1,0 +1,50 @@
+{
+  "files": {
+    "alloca_const.c": {
+      "functions": {
+        "fixed_buf": {
+          "lines": {
+            "4": {
+              "categories": [
+                "Conditional",
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "br",
+                "load",
+                "store"
+              ]
+            },
+            "5": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 1,
+              "opcodes": [
+                "load",
+                "store"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "alloca_const.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 1,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 2,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 2
+  }
+}

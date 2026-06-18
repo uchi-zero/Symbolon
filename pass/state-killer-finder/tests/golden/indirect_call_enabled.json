@@ -1,0 +1,39 @@
+{
+  "files": {
+    "indirect_call_enabled.c": {
+      "functions": {
+        "run": {
+          "lines": {
+            "3": {
+              "callees": [
+                "<indirect>"
+              ],
+              "categories": [
+                "ExternCallIndirect"
+              ],
+              "opcodes": [
+                "call"
+              ],
+              "severities": [
+                "conditional"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "indirect_call_enabled.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "ExternCallIndirect": 1
+    },
+    "by_severity": {
+      "conditional": 1,
+      "definite": 0,
+      "likely": 0
+    },
+    "total_findings": 1
+  }
+}

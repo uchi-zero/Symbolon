@@ -1,0 +1,130 @@
+--- a/bc/scan.l	2026-05-31 01:39:55.172201659 +0000
++++ b/bc/scan.l	2026-05-31 06:01:29.162209347 +0000
+@@ -192,6 +192,119 @@
+ 
+ #if !defined(READLINE) && !defined(LIBEDIT)
+ 
++#ifdef KLEE_BITCODE
++/* input-prefix-pin, unified (TRANSFORMATION.md "Rules: what counts as a
++   result"): pin the symbolic stdin to one of a menu of complete, valid bc
++   programs, selected by a symbolic klee_range. KLEE forks once on the
++   selector and explores EVERY program in a SINGLE run -- so the coverage is
++   one manifest.json / one eval-transformations invocation, never a cross-run
++   profraw union. Each program ends in "quit\n" (or fills all 40 bytes and
++   hits EOF) so its branch TERMINATES and emits a ktest; klee_assume records
++   the bytes on the symbolic stdin object (the native cov binary replays them)
++   and buf[i]=p[i] concretizes the lexer buffer so number.c's arithmetic stays
++   concrete (no solver-bound query blowup). Guarded by KLEE_BITCODE so the
++   native coverage binary never sees the klee_assume / klee_range intrinsics. */
++#include <klee/klee.h>
++static const char *const bc_klee_progs[] = {
++  "scale=5;7*9;8/3;2^9;7%3;sqrt(20)\nquit\n",
++  "define f(x){return(x*x)}\nf(5)\nquit\n",
++  "for(i=0;i<4;i++)a[i]=i*i\nquit\n",
++  "obase=16;255;1<2;9>3;5==5\nquit\n",
++  "i=3;while(i>0){i;i-=1}\nif(0)1\nquit\n",
++  "print \"hi\",length(123),scale(1.23)\nquit\n",
++  "ibase=16;a=FF;a+=9;a*=2;a^=2;a\nquit\n",
++  "a=9^99;a*a;0-a\nquit\n",
++  "define f(){auto y;return y}\nf()\nquit\n",
++  "warranty\nlimits\n1/0\nquit\n",
++  "a[1]=5;a[1]++;b=a[1];--b;++b\nquit\n",
++  "/*c*/2==2;i=5;i--\nquit\n",
++  "1 2\n)(\nquit\n",
++  "define f(a[]){return a[0]--}\nf(c[])\nquit\n",
++  "obase=2;10;5<2;0||0;!5\nquit\n",
++  "obase=99;255;scale=-1;a=-5\nquit\n",
++  "scale=3;1/7;2^9;sqrt(8);9%4;obase=8;255\n",
++  "for(;;){break}\nquit\n",
++  "for(i=0;i<3;i++){continue}\nquit\n",
++  "define f(n){if(n)f(n-1)}\nf(3)\nquit\n",
++  "define void g(){print 7}\ng();g()\nquit\n",
++  "ibase=8;777;o=obase;scale;.+1\nquit\n",
++  "sqrt(-1);4%0;2^-3\nquit\n",
++  "define f(a,b){return(a+b)}\nf(2,3)\nquit\n",
++  "if(0)1 else 2\nquit\n",
++  "print 1,2,\"x\",3\nquit\n",
++  "scale=30;1/3;2/7\nquit\n",
++  "-5+3;-(-2)\nquit\n",
++  "0^0;2^0;0^3;1^9\nquit\n",
++  "a[50]=1;a[0]=2;a[50]\nquit\n",
++  "x=5;x+=2;x-=1;x*=2;x/=3;x%=2\nquit\n",
++  "ibase=2;101;obase=2;5\nquit\n",
++  "length(0.01);scale(9.9)\nquit\n",
++  "i=0;while(i<4){i+=1;if(i>2)i}\nquit\n",
++  "a=3;b=a++ +5;b\nquit\n",
++  "1==1;1!=2;2<=2;3>=3;2<3\nquit\n",
++  "define f(){return}\nf()\nquit\n",
++  "define f(){1}\ndefine f(){2}\nf()\nquit\n",
++  "a=b=c=d=e=f=g=h=1;a+h\nquit\n",
++  "define f(n){if(n)f(n-1)}\nf(30)\nquit\n",
++  "2^999\nquit\n",
++  "scale=50;22/7;1/97\nquit\n",
++  "-9*-9;-8/3;-7%3;0-2^3\nquit\n",
++  "(1<2)&&(3>2);!0;1&&1&&0\nquit\n",
++  "a[a[1]=2]=3;a[2]\nquit\n",
++  "\"l1\"\n\"l2\"\nquit\n",
++  "obase=1;5;obase=16;255\nquit\n",
++  "scale=0;7/2;scale=9;7/2\nquit\n",
++  "a[99]=7;b[99]=a[99];b[99]\nquit\n",
++  "x=100;x%7;x%13;x/7%13\nquit\n",
++  "scale=40;sqrt(2);sqrt(123456)\nquit\n",
++  "a=7^200;b=3^200;a*b\nquit\n",
++  "scale=5;0-22/7;0-1/3\nquit\n",
++  "a=1>2;b=2>1;a+b;a*b\nquit\n",
++  "for(i=0;i<2;i++)for(j=0;j<2;j++)j\nquit\n",
++  "i=0;while(1){i+=1;if(i>3)break}\nquit\n",
++  "if(0)1 else if(1)2 else 3\nquit\n",
++  "ibase=16;ABC;DEF+1\nquit\n",
++  "obase=1000;123456\nquit\n",
++  "a=2;a=a^a^a;a\nquit\n"
++};
++enum { BC_KLEE_NPROGS = sizeof (bc_klee_progs) / sizeof (bc_klee_progs[0]) };
++static int bc_klee_pinned = 0;
++static void
++bc_klee_input (char *buf, int *result, int max_size)
++{
++  int r;
++  while ((r = read (fileno (yyin), (char *) buf, max_size)) < 0)
++    if (errno != EINTR)
++      {
++	yyerror ("read() in flex scanner failed");
++	bc_exit (1);
++      }
++  if (!bc_klee_pinned && yyin == stdin && r > 0)
++    {
++      unsigned sel = (unsigned) klee_range (0, BC_KLEE_NPROGS, "bc_prog_sel");
++      const char *p = bc_klee_progs[0];
++      unsigned k;
++      int n = 0, i;
++      bc_klee_pinned = 1;
++      /* Concrete pointer in each forked state (no symbolic array index). */
++      for (k = 1; k < (unsigned) BC_KLEE_NPROGS; k++)
++	if (sel == k)
++	  p = bc_klee_progs[k];
++      while (p[n] != '\0')
++	n++;
++      if (n > r)
++	n = r;
++      for (i = 0; i < n; i++)
++	{
++	  klee_assume (buf[i] == p[i]);
++	  buf[i] = p[i];
++	}
++    }
++  *result = r;
++}
++#undef  YY_INPUT
++#define YY_INPUT(buf,result,max_size) bc_klee_input(buf, &result, max_size)
++#else
+ /* MINIX returns from read with < 0 if SIGINT is  encountered.
+    In flex, we can redefine YY_INPUT to the following.  In lex, this
+    does nothing! */
+@@ -201,6 +314,7 @@
+ 	    if (errno != EINTR) \
+ 		YY_FATAL_ERROR( "read() in flex scanner failed" );
+ #endif
++#endif
+ 
+ %}
+ DIGIT [0-9A-Z]

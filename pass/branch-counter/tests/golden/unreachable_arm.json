@@ -1,0 +1,22 @@
+{
+  "files": {
+    "unreachable_arm.c": {
+      "branch_count": 1,
+      "branches": [
+        {
+          "line": 5,
+          "opcode": "br",
+          "outcomes": 2
+        }
+      ],
+      "outcome_count": 2
+    }
+  },
+  "module": "unreachable_arm.bc",
+  "schema_version": 1,
+  "summary": {
+    "total_branches": 1,
+    "total_files": 1,
+    "total_outcomes": 2
+  }
+}

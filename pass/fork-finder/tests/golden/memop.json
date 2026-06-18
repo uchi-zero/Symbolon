@@ -1,0 +1,50 @@
+{
+  "files": {
+    "memop.c": {
+      "functions": {
+        "copy_one": {
+          "lines": {
+            "3": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "load",
+                "store"
+              ]
+            },
+            "4": {
+              "categories": [
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "load"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "memop.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 0,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 2,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 2,
+    "unlocated_by_category": {
+      "MemOp": 2
+    }
+  }
+}

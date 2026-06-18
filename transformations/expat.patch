@@ -1,0 +1,93 @@
+--- a/lib/xmlparse.c	2026-06-06 23:02:27.998216537 +0000
++++ b/lib/xmlparse.c	2026-06-06 23:02:28.031216558 +0000
+@@ -115,6 +115,10 @@
+ #include "expat.h"
+ #include "siphash.h"
+ 
++#ifdef KLEE_BITCODE
++#  include <klee/klee.h> /* klee_range()/klee_assume() for the input-menu-pin below */
++#endif
++
+ #if defined(HAVE_ARC4RANDOM)
+ #  include "random_arc4random.h"
+ #endif /* defined(HAVE_ARC4RANDOM) */
+@@ -2262,6 +2266,79 @@
+       parser->m_errorCode = XML_ERROR_INVALID_ARGUMENT;
+     return XML_STATUS_ERROR;
+   }
++#ifdef KLEE_BITCODE
++  /* input-menu-pin (code-transformation skill), round 4: r3 proved a single
++     self-terminating pinned document raises coverage to ~2,160 lines uniformly
++     across searchers, but ONE document drives one deterministic path family and
++     expat's grammar has many mutually-exclusive declaration / markup forms. This
++     pins the symbolic stdin to ONE OF A MENU of complete, self-terminating XML
++     documents, selected by a symbolic klee_range: KLEE forks once on the
++     selector and explores EVERY menu entry in a single run/bitcode (the
++     sanctioned single-run equivalent of pinning each doc separately and merging
++     -- no cross-run profraw union). Each entry exercises a distinct form: [0]
++     <!ELEMENT>+<!ATTLIST> (= r3), [1] <!ENTITY> decl + general-entity reference
++     expansion, [2] content-model group + nested child tree, [3] CDATA section +
++     comment + processing instruction in content, [4] <!NOTATION> declaration.
++     Each fork picks a concrete entry, klee_assume's the stdin equals it (so the
++     emitted ktest replays that exact document on the native cov binary), and
++     concretizes the buffer so parsing stays fork-free.
++
++     CRITICAL: every menu document is padded with trailing spaces to EXACTLY the
++     full 100-byte symbolic stdin width, leaving NO symbolic byte unpinned. This
++     is what keeps nurs:md2u alive: an UNpadded menu (shorter docs leave a
++     symbolic tail) explodes md2u to ~900k states at the 32 GB cap with 0
++     completed paths / 0 ktests -- the same starvation that shelved r2. Trailing
++     whitespace after the root close is legal XML epilog, so each padded entry
++     still parses to XML_STATUS_OK; with the tail concrete, every menu branch is
++     a bounded path family that all four searchers finish. The menu scales
++     cleanly (5 docs -> 2,546 lines, 10 -> 2,906, 16 -> 3,092, all four searchers
++     identical) and can be extended with more forms in later rounds.
++
++     Same XML_Parse pin site as r1/r2/r3 (REPLACES them; cannot stack). Guarded
++     by KLEE_BITCODE; a static
++     flag pins only the first top-level XML_Parse call. */
++  {
++    static const char *const klee_menu[] = {
++      "<?xml version='1.0'?><!DOCTYPE a [<!ELEMENT a ANY><!ATTLIST a b CDATA #IMPLIED>]><a b='c'></a>      ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!ELEMENT a ANY><!ENTITY e \"x\">]><a>&e;</a>                       ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!ELEMENT a (b)><!ELEMENT b EMPTY>]><a><b/></a>                   ",
++      "<?xml version='1.0'?><a><![CDATA[x]]><!--c--><?pi v?></a>                                           ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!NOTATION n SYSTEM 'u'><!ELEMENT a EMPTY>]><a/>                  ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!ELEMENT a EMPTY><!ATTLIST a b (x|y) 'x'>]><a b='y'/>            ",
++      "<?xml version='1.0' encoding='UTF-8' standalone='yes'?><a/>                                         ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!ENTITY % p 'x'><!ELEMENT a EMPTY>]><a/>                         ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!ELEMENT a ANY>]><a x='1' y='2'>t<b/>u</a>                       ",
++      "<?xml version='1.0'?><a>&#65;&lt;&amp;</a>                                                          ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!ELEMENT a (b|c)*><!ELEMENT b EMPTY><!ELEMENT c EMPTY>]><a/>     ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!ELEMENT a ANY><!ATTLIST a b CDATA #REQUIRED>]><a b='v'/>        ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!ELEMENT a ANY><!ATTLIST a b NMTOKEN #FIXED 'k'>]><a b='k'/>     ",
++      "<?xml version='1.0'?><!DOCTYPE a [<!ELEMENT a (#PCDATA|b)*><!ELEMENT b EMPTY>]><a>t<b/></a>         ",
++      "<?xml version='1.0'?><!-- top --><?pi x?><!DOCTYPE a [<!ELEMENT a EMPTY>]><a/>                      ",
++      "<?xml version='1.0'?><!DOCTYPE a SYSTEM 'u' [<!ELEMENT a EMPTY>]><a/>                               "
++    };
++    enum { KLEE_NMENU = 16 };
++    static int klee_pinned = 0;
++    if (! klee_pinned && s != NULL && len > 0) {
++      unsigned sel = (unsigned)klee_range(0, KLEE_NMENU, "expat_menu_sel");
++      const char *p = klee_menu[0];
++      unsigned k;
++      int i, plen;
++      klee_pinned = 1;
++      for (k = 1; k < KLEE_NMENU; k++)
++        if (sel == k)
++          p = klee_menu[k];
++      plen = 0;
++      while (p[plen] != '\0')
++        plen++;
++      if (plen > len)
++        plen = len;
++      for (i = 0; i < plen; i++) {
++        klee_assume(s[i] == p[i]);
++        ((char *)s)[i] = p[i];
++      }
++    }
++  }
++#endif
+   switch (parser->m_parsingStatus.parsing) {
+   case XML_SUSPENDED:
+     parser->m_errorCode = XML_ERROR_SUSPENDED;

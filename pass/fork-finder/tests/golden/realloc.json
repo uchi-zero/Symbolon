@@ -1,0 +1,42 @@
+{
+  "files": {
+    "realloc.c": {
+      "functions": {
+        "resize": {
+          "lines": {
+            "3": {
+              "categories": [
+                "MemOp",
+                "Realloc"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "call",
+                "load"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "realloc.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 0,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 1,
+      "Realloc": 1,
+      "Switch": 0
+    },
+    "total_findings": 1,
+    "unlocated_by_category": {
+      "MemOp": 2
+    }
+  }
+}

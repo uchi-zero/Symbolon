@@ -1,0 +1,42 @@
+{
+  "files": {
+    "free.c": {
+      "functions": {
+        "release": {
+          "lines": {
+            "3": {
+              "categories": [
+                "Free",
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "call",
+                "load"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "free.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 0,
+      "Conditional": 0,
+      "Free": 1,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 1,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 1,
+    "unlocated_by_category": {
+      "MemOp": 1
+    }
+  }
+}

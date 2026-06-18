@@ -1,0 +1,22 @@
+{
+  "files": {
+    "simple_if.c": {
+      "branch_count": 1,
+      "branches": [
+        {
+          "line": 3,
+          "opcode": "br",
+          "outcomes": 2
+        }
+      ],
+      "outcome_count": 2
+    }
+  },
+  "module": "simple_if.bc",
+  "schema_version": 1,
+  "summary": {
+    "total_branches": 1,
+    "total_files": 1,
+    "total_outcomes": 2
+  }
+}

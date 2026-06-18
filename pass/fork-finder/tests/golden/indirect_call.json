@@ -1,0 +1,42 @@
+{
+  "files": {
+    "indirect_call.c": {
+      "functions": {
+        "run": {
+          "lines": {
+            "3": {
+              "categories": [
+                "Call",
+                "MemOp"
+              ],
+              "loop_depth": 0,
+              "opcodes": [
+                "call",
+                "load"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "module": "indirect_call.bc",
+  "schema_version": 2,
+  "summary": {
+    "by_category": {
+      "Alloc": 0,
+      "Call": 1,
+      "Conditional": 0,
+      "Free": 0,
+      "Indirect": 0,
+      "LibraryLoop": 0,
+      "MemOp": 1,
+      "Realloc": 0,
+      "Switch": 0
+    },
+    "total_findings": 1,
+    "unlocated_by_category": {
+      "MemOp": 2
+    }
+  }
+}

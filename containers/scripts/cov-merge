@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# cov-merge — merge llvm-cov profraw files and emit standard reports.
+#
+# Outputs in --out:
+#   program.profdata   merged profile data
+#   coverage.lcov      lcov-format (for codecov, lcov tools)
+#   report.json        machine-readable per-file/line coverage (consumed by agent)
+#   summary.txt        human summary table
+#   html/              llvm-cov show HTML report
+
+# @option --binary!         Path to instrumented binary (the coverage oracle).
+# @option --profraw-dir!    Directory containing one .profraw per replayed ktest.
+# @option --out!            Output directory for merged reports.
+
+set -euo pipefail
+eval "$(argc --argc-eval "$0" "$@")"
+
+binary="$argc_binary"
+profraw_dir="$argc_profraw_dir"
+out="$argc_out"
+
+mkdir -p "$out" "$out/html"
+
+# Flat-directory expectation: callers (eval-klee, klee-replay-all) drop one
+# .profraw per ktest directly into $profraw_dir; we do not recurse.
+shopt -s nullglob
+profraws=("$profraw_dir"/*.profraw)
+shopt -u nullglob
+
+if (( ${#profraws[@]} == 0 )); then
+  echo "cov-merge: no profraw files in $profraw_dir; emitting empty reports" >&2
+  : > "$out/program.profdata"
+  : > "$out/coverage.lcov"
+  printf '{"data": [], "type": "llvm.coverage.json.export", "version": "2.0.1"}\n' \
+    > "$out/report.json"
+  echo "TOTAL lines covered: 0/0 (no profraw)" > "$out/summary.txt"
+  : > "$out/html/index.html"
+  exit 0
+fi
+
+llvm-profdata merge -sparse -o "$out/program.profdata" "${profraws[@]}"
+
+llvm-cov export --instr-profile "$out/program.profdata" --format=lcov "$binary" > "$out/coverage.lcov"
+llvm-cov export --instr-profile "$out/program.profdata" --format=text "$binary" > "$out/report.json"
+llvm-cov report --instr-profile "$out/program.profdata" "$binary" > "$out/summary.txt"
+llvm-cov show --instr-profile "$out/program.profdata" --format=html "$binary" --output-dir "$out/html"

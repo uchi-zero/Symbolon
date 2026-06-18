@@ -1,0 +1,106 @@
+--- a/src/pch.c	2026-06-06 13:27:03.844564594 +0000
++++ b/src/pch.c	2026-06-06 13:27:49.310284561 +0000
+@@ -29,6 +29,13 @@
+ #endif
+ #include <safe.h>
+ 
++#ifdef KLEE_BITCODE
++# include <klee/klee.h>
++/* r2-format-menu: cohort selector chosen in open_patch_file() and shared with
++ * scan_input() (inp.c) so the pinned origfile matches the pinned patch shape. */
++unsigned int klee_patch_cohort;
++#endif
++
+ #define INITHUNKMAX 125			/* initial dynamic allocation size */
+ 
+ /* Patch (diff listing) abstract type. */
+@@ -165,6 +172,53 @@
+ 	Fseeko (pfp, 0, SEEK_SET);
+       }
+     p_filesize = st.st_size;
++#ifdef KLEE_BITCODE
++    /* r2-format-menu (generalizes r1 input-prefix-pin): the patch file (argv
++     * operand "B") is 50 fully-symbolic bytes, so intuit_diff_type() forks
++     * byte-by-byte against every diff-format literal. r1 pinned B to one
++     * unified hunk, leaving the CONTEXT / ED / NORMAL parser arms of
++     * intuit_diff_type() and another_hunk() cold. Here we pin B to one of a
++     * MENU of well-formed diffs in the four formats patch auto-detects from
++     * file content alone (no argv flag needed, so every cohort replays on the
++     * pristine coverage oracle):
++     *
++     *   0 unified : "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"
++     *   1 context : "***************\n*** 2 ****\n! b\n--- 2 ----\n! B\n"
++     *   2 ed      : "2c\nB\n.\n"
++     *   3 normal  : "2c2\n< b\n---\n> B\n"
++     *
++     * All four edit line 2 of the origfile, which scan_input() pins to
++     * "a\nb\nc\n" (inp.c), so each format drives its deep parser AND applies
++     * cleanly (apply_hunk / do_ed_script). KLEE forks once on the selector and
++     * explores all four formats in one run; the ktests carry the concrete
++     * file bytes, so the replay reproduces each format on the oracle.
++     *
++     * Pin via getc/rewind: open_patch_file leaves pfp at byte 0 for a regular
++     * file and intuit_diff_type re-seeks to p_base (0), so the rewind restores
++     * the stream. */
++    if (pfp && S_ISREG (st.st_mode))
++      {
++	static const char pin_unified[] = "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
++	static const char pin_context[] =
++	  "***************\n*** 2 ****\n! b\n--- 2 ----\n! B\n";
++	static const char pin_ed[]      = "2c\nB\n.\n";
++	static const char pin_normal[]  = "2c2\n< b\n---\n> B\n";
++	const char *pin = pin_unified;
++	idx_t pin_len = sizeof (pin_unified) - 1;
++	klee_patch_cohort = (unsigned int) klee_range (0, 4, "patch_format");
++	if (klee_patch_cohort == 1)      { pin = pin_context; pin_len = sizeof (pin_context) - 1; }
++	else if (klee_patch_cohort == 2) { pin = pin_ed;      pin_len = sizeof (pin_ed) - 1; }
++	else if (klee_patch_cohort == 3) { pin = pin_normal;  pin_len = sizeof (pin_normal) - 1; }
++	for (idx_t k = 0; k < pin_len; k++)
++	  {
++	    int ch = getc (pfp);
++	    if (ch < 0)
++	      break;
++	    klee_assume ((unsigned char) ch == (unsigned char) pin[k]);
++	  }
++	rewind (pfp);
++      }
++#endif
+     next_intuit_at (file_pos, 1);
+ }
+ 
+--- a/src/inp.c	2026-06-06 13:27:03.843564600 +0000
++++ b/src/inp.c	2026-06-06 13:28:10.925151358 +0000
+@@ -25,6 +25,13 @@
+ #include <inp.h>
+ #include <safe.h>
+ 
++#ifdef KLEE_BITCODE
++# include <klee/klee.h>
++/* r2-format-menu: cohort selector set in open_patch_file() (pch.c). scan_input()
++ * pins the origfile to match the pinned patch hunk so every format applies. */
++extern unsigned int klee_patch_cohort;
++#endif
++
+ /* Input-file-with-indexable-lines abstract type */
+ 
+ static char *i_buffer;			/* buffer of input file lines */
+@@ -197,6 +204,19 @@
+ 	}
+   }
+ 
++#ifdef KLEE_BITCODE
++  /* r2-format-menu: pin the origfile prefix to "a\nb\nc\n" so each pinned
++   * patch shape (unified / context / ed / normal, all editing line 2) locates
++   * and applies cleanly, driving the apply path (apply_hunk / do_ed_script)
++   * rather than aborting on a mismatch. The tail past byte 6 stays symbolic. */
++  if (size >= 6)
++    {
++      static const char in_pin[] = "a\nb\nc\n";
++      for (idx_t k = 0; k < (idx_t) (sizeof (in_pin) - 1); k++)
++	klee_assume ((unsigned char) buffer[k] == (unsigned char) in_pin[k]);
++    }
++#endif
++
+   /* Scan the buffer and build array of pointers to lines.  */
+   char const *lim = buffer + size;
+   idx_t iline = 3; /* 1 unused, 1 for SOF,

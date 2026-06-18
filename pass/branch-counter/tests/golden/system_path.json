@@ -1,0 +1,33 @@
+{
+  "files": {
+    "stdbit.h": {
+      "branch_count": 1,
+      "branches": [
+        {
+          "line": 79,
+          "opcode": "br",
+          "outcomes": 2
+        }
+      ],
+      "outcome_count": 2
+    },
+    "system_path.c": {
+      "branch_count": 1,
+      "branches": [
+        {
+          "line": 7,
+          "opcode": "br",
+          "outcomes": 2
+        }
+      ],
+      "outcome_count": 2
+    }
+  },
+  "module": "system_path.bc",
+  "schema_version": 1,
+  "summary": {
+    "total_branches": 2,
+    "total_files": 2,
+    "total_outcomes": 4
+  }
+}
